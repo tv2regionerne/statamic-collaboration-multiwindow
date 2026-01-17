@@ -208,6 +208,14 @@ export default class Workspace {
             this.applyBroadcastedValueChange(e);
         });
 
+        // Handle large payloads - fetch from server instead of receiving via WebSocket
+        this.listenForWhisper('fetch-field', async ({ handle, type, windowId }) => {
+            if (windowId === this.windowId) return;
+
+            this.debug(`📥 Fetching ${type} for "${handle}" from server (large payload)`);
+            await this.fetchFieldFromServer(handle, type);
+        });
+
         this.listenForWhisper('meta-updated', e => {
             this.applyBroadcastedMetaChange(e);
         });
@@ -503,7 +511,16 @@ export default class Workspace {
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
-            this.whisper('updated', { ...payload, windowId: this.windowId });
+            const fullPayload = { ...payload, windowId: this.windowId };
+            const payloadSize = JSON.stringify(fullPayload).length;
+
+            // If payload is larger than 3KB, tell others to fetch from server instead
+            if (payloadSize > 3000) {
+                this.debug(`📦 Payload too large (${payloadSize} bytes), sending fetch notification`);
+                this.whisper('fetch-field', { handle: payload.handle, type: 'value', windowId: this.windowId });
+            } else {
+                this.whisper('updated', fullPayload);
+            }
         }
     }
 
@@ -513,7 +530,16 @@ export default class Workspace {
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
-            this.whisper('meta-updated', { ...this.cleanMetaPayload(payload), windowId: this.windowId });
+            const cleanedPayload = { ...this.cleanMetaPayload(payload), windowId: this.windowId };
+            const payloadSize = JSON.stringify(cleanedPayload).length;
+
+            // If payload is larger than 3KB, tell others to fetch from server instead
+            if (payloadSize > 3000) {
+                this.debug(`📦 Meta payload too large (${payloadSize} bytes), sending fetch notification`);
+                this.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
+            } else {
+                this.whisper('meta-updated', cleanedPayload);
+            }
         }
     }
 
@@ -703,6 +729,54 @@ export default class Workspace {
             this.initialStateUpdated = true;
         } catch (error) {
             this.debug('Failed to load cached state', { error });
+        }
+    }
+
+    async fetchFieldFromServer(handle, type) {
+        try {
+            const response = await fetch(this.stateApiUrl, {
+                headers: {
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                credentials: 'same-origin',
+            });
+
+            if (!response.ok) return;
+
+            const data = await response.json();
+
+            if (!data.exists) {
+                this.debug('No cached state found for field fetch');
+                return;
+            }
+
+            this.applyingBroadcast = true;
+            try {
+                if (type === 'value' && data.values && data.values[handle] !== undefined) {
+                    this.debug(`✅ Applying fetched value for "${handle}"`, data.values[handle]);
+                    Statamic.$store.dispatch(`publish/${this.container.name}/setFieldValue`, {
+                        handle,
+                        value: data.values[handle],
+                        user: null, // Mark as external change
+                    });
+                } else if (type === 'meta' && data.meta && data.meta[handle] !== undefined) {
+                    this.debug(`✅ Applying fetched meta for "${handle}"`, data.meta[handle]);
+                    const currentMeta = this.lastMetaValues[handle] || {};
+                    Statamic.$store.dispatch(`publish/${this.container.name}/setFieldMeta`, {
+                        handle,
+                        value: { ...currentMeta, ...data.meta[handle] },
+                        user: null, // Mark as external change
+                    });
+                }
+            } finally {
+                this.applyingBroadcast = false;
+            }
+
+            // Reset activity timer since we received an update
+            this.resetActivityTimer();
+        } catch (error) {
+            this.debug('Failed to fetch field from server', { error });
         }
     }
 
