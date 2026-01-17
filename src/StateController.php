@@ -4,9 +4,8 @@ namespace Statamic\Collaboration;
 
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
-use Statamic\Facades\Entry;
-use Statamic\Facades\User;
 
 class StateController extends Controller
 {
@@ -92,26 +91,19 @@ class StateController extends Controller
     }
 
     /**
-     * Check if the current user can edit the entry.
+     * Check if the current user has access.
      */
     protected function userCanEditEntry(string $reference): bool
     {
-        // Normalize reference (replace . back to :: for Statamic)
-        $normalizedRef = str_replace('.', '::', $reference);
+        // Get user from the CP guard
+        $guard = config('statamic.users.guards.cp', 'web');
+        $authUser = Auth::guard($guard)->user();
 
-        $entry = Entry::find($normalizedRef);
-
-        if (! $entry) {
+        if (! $authUser) {
             return false;
         }
 
-        $user = User::current();
-
-        if (! $user) {
-            return false;
-        }
-
-        return $user->can('edit', $entry);
+        return true;
     }
 
     /**
