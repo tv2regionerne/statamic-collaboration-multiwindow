@@ -150,22 +150,28 @@ export default class Workspace {
 
         // Listen for initial state from other windows (targeted to our windowId)
         // This always merges state since other windows may have fresher data than cached state
-        this.channel.listenForWhisper(`initialize-state-for-window-${this.windowId}`, payload => {
+        this.channel.listenForWhisper(`initialize-state-for-window-${this.windowId}`, async payload => {
             this.debug('✅ Applying/merging state from another window', payload);
 
-            // Merge values with current state
-            const currentValues = Statamic.$store.state.publish[this.container.name].values;
-            const mergedValues = { ...currentValues, ...payload.values };
-            Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
+            // Mark that we're applying external data to prevent re-broadcasting
+            this.applyingBroadcast = true;
+            try {
+                // Merge values with current state
+                const currentValues = Statamic.$store.state.publish[this.container.name].values;
+                const mergedValues = { ...currentValues, ...payload.values };
+                await Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
 
-            // Merge meta with current state
-            const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
-            const restoredMeta = this.restoreEntireMetaPayload(payload.meta);
-            const mergedMeta = { ...currentMeta };
-            Object.keys(restoredMeta).forEach(handle => {
-                mergedMeta[handle] = { ...currentMeta[handle], ...restoredMeta[handle] };
-            });
-            Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
+                // Merge meta with current state
+                const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
+                const restoredMeta = this.restoreEntireMetaPayload(payload.meta);
+                const mergedMeta = { ...currentMeta };
+                Object.keys(restoredMeta).forEach(handle => {
+                    mergedMeta[handle] = { ...currentMeta[handle], ...restoredMeta[handle] };
+                });
+                await Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
+            } finally {
+                this.applyingBroadcast = false;
+            }
 
             // Apply focus locks from other windows
             _.each(payload.focus, ({ user, handle }) => {
@@ -577,7 +583,7 @@ export default class Workspace {
         });
     }
 
-    applyBroadcastedValueChange(payload) {
+    async applyBroadcastedValueChange(payload) {
         // Ignore broadcasts from this same window
         if (payload.windowId === this.windowId) return;
 
@@ -586,13 +592,13 @@ export default class Workspace {
         // Mark that we're applying a broadcast to prevent re-broadcasting
         this.applyingBroadcast = true;
         try {
-            Statamic.$store.dispatch(`publish/${this.container.name}/setFieldValue`, payload);
+            await Statamic.$store.dispatch(`publish/${this.container.name}/setFieldValue`, payload);
         } finally {
             this.applyingBroadcast = false;
         }
     }
 
-    applyBroadcastedMetaChange(payload) {
+    async applyBroadcastedMetaChange(payload) {
         // Ignore broadcasts from this same window
         if (payload.windowId === this.windowId) return;
 
@@ -604,7 +610,7 @@ export default class Workspace {
         // Mark that we're applying a broadcast to prevent re-broadcasting
         this.applyingBroadcast = true;
         try {
-            Statamic.$store.dispatch(`publish/${this.container.name}/setFieldMeta`, payload);
+            await Statamic.$store.dispatch(`publish/${this.container.name}/setFieldMeta`, payload);
         } finally {
             this.applyingBroadcast = false;
         }
@@ -727,7 +733,7 @@ export default class Workspace {
                 if (data.values && Object.keys(data.values).length > 0) {
                     const currentValues = Statamic.$store.state.publish[this.container.name].values;
                     const mergedValues = { ...currentValues, ...data.values };
-                    Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
+                    await Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
                 }
 
                 // Apply cached meta - merge with current meta
@@ -737,7 +743,7 @@ export default class Workspace {
                     Object.keys(data.meta).forEach(handle => {
                         mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
                     });
-                    Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
+                    await Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
                 }
             } finally {
                 this.applyingBroadcast = false;
