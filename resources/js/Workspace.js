@@ -505,7 +505,7 @@ export default class Workspace {
         return JSON.stringify(lastValue) !== JSON.stringify(newValue);
     }
 
-    broadcastValueChange(payload) {
+    async broadcastValueChange(payload) {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
         if (this.applyingBroadcast) return;
 
@@ -516,8 +516,8 @@ export default class Workspace {
             // For large payloads (>3KB), persist immediately and notify others to fetch from server
             if (JSON.stringify(fullPayload).length > 3000) {
                 this.debug(`📦 Large payload for "${payload.handle}", persisting and sending fetch notification`);
-                // Persist immediately (not debounced) so it's available when others fetch
-                this.sendStateUpdate(payload.handle, payload.value, 'value');
+                // Wait for persist to complete before notifying others to fetch
+                await this.sendStateUpdate(payload.handle, payload.value, 'value');
                 this.channel.whisper('fetch-field', { handle: payload.handle, type: 'value', windowId: this.windowId });
             } else {
                 this.whisper('updated', fullPayload);
@@ -525,7 +525,7 @@ export default class Workspace {
         }
     }
 
-    broadcastMetaChange(payload) {
+    async broadcastMetaChange(payload) {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
         if (this.applyingBroadcast) return;
 
@@ -536,8 +536,8 @@ export default class Workspace {
             // For large payloads (>3KB), persist immediately and notify others to fetch from server
             if (JSON.stringify(cleanedPayload).length > 3000) {
                 this.debug(`📦 Large meta payload for "${payload.handle}", persisting and sending fetch notification`);
-                // Persist immediately (not debounced) so it's available when others fetch
-                this.sendStateUpdate(payload.handle, payload.value, 'meta');
+                // Wait for persist to complete before notifying others to fetch
+                await this.sendStateUpdate(payload.handle, payload.value, 'meta');
                 this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
             } else {
                 this.whisper('meta-updated', cleanedPayload);
@@ -720,21 +720,27 @@ export default class Workspace {
 
             this.debug('✅ Applying cached state from server', data);
 
-            // Apply cached values - merge with current values
-            if (data.values && Object.keys(data.values).length > 0) {
-                const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                const mergedValues = { ...currentValues, ...data.values };
-                Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
-            }
+            // Mark that we're applying external data to prevent re-broadcasting
+            this.applyingBroadcast = true;
+            try {
+                // Apply cached values - merge with current values
+                if (data.values && Object.keys(data.values).length > 0) {
+                    const currentValues = Statamic.$store.state.publish[this.container.name].values;
+                    const mergedValues = { ...currentValues, ...data.values };
+                    Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
+                }
 
-            // Apply cached meta - merge with current meta
-            if (data.meta && Object.keys(data.meta).length > 0) {
-                const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
-                const mergedMeta = { ...currentMeta };
-                Object.keys(data.meta).forEach(handle => {
-                    mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
-                });
-                Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
+                // Apply cached meta - merge with current meta
+                if (data.meta && Object.keys(data.meta).length > 0) {
+                    const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
+                    const mergedMeta = { ...currentMeta };
+                    Object.keys(data.meta).forEach(handle => {
+                        mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
+                    });
+                    Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
+                }
+            } finally {
+                this.applyingBroadcast = false;
             }
 
             this.initialStateUpdated = true;
