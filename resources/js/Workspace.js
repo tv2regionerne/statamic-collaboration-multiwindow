@@ -115,8 +115,8 @@ export default class Workspace {
             this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
         });
 
-        // Listen for other windows joining
-        this.listenForWhisper('window-joined', ({ windowId, user }) => {
+        // Listen for other windows joining (use direct listener, no chunking needed)
+        this.channel.listenForWhisper('window-joined', ({ windowId, user }) => {
             if (windowId === this.windowId) return;
 
             this.debug(`Window joined: ${windowId}`, { user });
@@ -134,23 +134,23 @@ export default class Workspace {
             });
         });
 
-        // Listen for existing windows announcing themselves
-        this.listenForWhisper('window-present', ({ windowId, user }) => {
+        // Listen for existing windows announcing themselves (use direct listener)
+        this.channel.listenForWhisper('window-present', ({ windowId, user }) => {
             if (windowId === this.windowId) return;
 
             this.debug(`Window present: ${windowId}`, { user });
             this.activeWindows.add(windowId);
         });
 
-        // Listen for windows leaving
-        this.listenForWhisper('window-left', ({ windowId }) => {
+        // Listen for windows leaving (use direct listener)
+        this.channel.listenForWhisper('window-left', ({ windowId }) => {
             this.debug(`Window left: ${windowId}`);
             this.activeWindows.delete(windowId);
         });
 
         // Listen for initial state from other windows (targeted to our windowId)
         // This always merges state since other windows may have fresher data than cached state
-        this.listenForWhisper(`initialize-state-for-window-${this.windowId}`, payload => {
+        this.channel.listenForWhisper(`initialize-state-for-window-${this.windowId}`, payload => {
             this.debug('✅ Applying/merging state from another window', payload);
 
             // Merge values with current state
@@ -209,11 +209,11 @@ export default class Workspace {
         });
 
         // Handle large payloads - fetch from server instead of receiving via WebSocket
-        this.listenForWhisper('fetch-field', async ({ handle, type, windowId }) => {
+        this.channel.listenForWhisper('fetch-field', ({ handle, type, windowId }) => {
             if (windowId === this.windowId) return;
 
             this.debug(`📥 Fetching ${type} for "${handle}" from server (large payload)`);
-            await this.fetchFieldFromServer(handle, type);
+            this.loadCachedState(); // Reload all state from server
         });
 
         this.listenForWhisper('meta-updated', e => {
@@ -505,42 +505,40 @@ export default class Workspace {
         return JSON.stringify(lastValue) !== JSON.stringify(newValue);
     }
 
-    async broadcastValueChange(payload) {
+    broadcastValueChange(payload) {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
         if (this.applyingBroadcast) return;
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
             const fullPayload = { ...payload, windowId: this.windowId };
-            const payloadSize = JSON.stringify(fullPayload).length;
 
-            // If payload is larger than 3KB, tell others to fetch from server instead
-            if (payloadSize > 3000) {
-                this.debug(`📦 Payload too large (${payloadSize} bytes), persisting and sending fetch notification`);
+            // For large payloads (>3KB), persist immediately and notify others to fetch from server
+            if (JSON.stringify(fullPayload).length > 3000) {
+                this.debug(`📦 Large payload for "${payload.handle}", persisting and sending fetch notification`);
                 // Persist immediately (not debounced) so it's available when others fetch
-                await this.sendStateUpdate(payload.handle, payload.value, 'value');
-                this.whisper('fetch-field', { handle: payload.handle, type: 'value', windowId: this.windowId });
+                this.sendStateUpdate(payload.handle, payload.value, 'value');
+                this.channel.whisper('fetch-field', { handle: payload.handle, type: 'value', windowId: this.windowId });
             } else {
                 this.whisper('updated', fullPayload);
             }
         }
     }
 
-    async broadcastMetaChange(payload) {
+    broadcastMetaChange(payload) {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
         if (this.applyingBroadcast) return;
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
             const cleanedPayload = { ...this.cleanMetaPayload(payload), windowId: this.windowId };
-            const payloadSize = JSON.stringify(cleanedPayload).length;
 
-            // If payload is larger than 3KB, tell others to fetch from server instead
-            if (payloadSize > 3000) {
-                this.debug(`📦 Meta payload too large (${payloadSize} bytes), persisting and sending fetch notification`);
+            // For large payloads (>3KB), persist immediately and notify others to fetch from server
+            if (JSON.stringify(cleanedPayload).length > 3000) {
+                this.debug(`📦 Large meta payload for "${payload.handle}", persisting and sending fetch notification`);
                 // Persist immediately (not debounced) so it's available when others fetch
-                await this.sendStateUpdate(payload.handle, payload.value, 'meta');
-                this.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
+                this.sendStateUpdate(payload.handle, payload.value, 'meta');
+                this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
             } else {
                 this.whisper('meta-updated', cleanedPayload);
             }
@@ -618,7 +616,16 @@ export default class Workspace {
 
     isAlone() {
         // Check if this is the only window (not just the only user)
-        return this.activeWindows.size <= 1;
+        // Also check users from presence channel as fallback
+        const users = Statamic.$store.state.collaboration[this.channelName]?.users || [];
+        const multipleUsers = users.length > 1;
+        const multipleWindows = this.activeWindows.size > 1;
+
+        // Not alone if multiple users OR multiple windows
+        const alone = !multipleUsers && !multipleWindows;
+
+        this.debug(`isAlone check: users=${users.length}, activeWindows=${this.activeWindows.size}, alone=${alone}`);
+        return alone;
     }
 
     whisper(event, payload, { force = false } = {}) {
@@ -733,54 +740,6 @@ export default class Workspace {
             this.initialStateUpdated = true;
         } catch (error) {
             this.debug('Failed to load cached state', { error });
-        }
-    }
-
-    async fetchFieldFromServer(handle, type) {
-        try {
-            const response = await fetch(this.stateApiUrl, {
-                headers: {
-                    'Accept': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest',
-                },
-                credentials: 'same-origin',
-            });
-
-            if (!response.ok) return;
-
-            const data = await response.json();
-
-            if (!data.exists) {
-                this.debug('No cached state found for field fetch');
-                return;
-            }
-
-            this.applyingBroadcast = true;
-            try {
-                if (type === 'value' && data.values && data.values[handle] !== undefined) {
-                    this.debug(`✅ Applying fetched value for "${handle}"`, data.values[handle]);
-                    Statamic.$store.dispatch(`publish/${this.container.name}/setFieldValue`, {
-                        handle,
-                        value: data.values[handle],
-                        user: null, // Mark as external change
-                    });
-                } else if (type === 'meta' && data.meta && data.meta[handle] !== undefined) {
-                    this.debug(`✅ Applying fetched meta for "${handle}"`, data.meta[handle]);
-                    const currentMeta = this.lastMetaValues[handle] || {};
-                    Statamic.$store.dispatch(`publish/${this.container.name}/setFieldMeta`, {
-                        handle,
-                        value: { ...currentMeta, ...data.meta[handle] },
-                        user: null, // Mark as external change
-                    });
-                }
-            } finally {
-                this.applyingBroadcast = false;
-            }
-
-            // Reset activity timer since we received an update
-            this.resetActivityTimer();
-        } catch (error) {
-            this.debug('Failed to fetch field from server', { error });
         }
     }
 
