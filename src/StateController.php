@@ -9,9 +9,9 @@ use Illuminate\Support\Facades\Cache;
 class StateController extends Controller
 {
     /**
-     * Cache TTL in seconds (2 hours - states expire after no activity)
+     * Cache TTL in seconds (24 hours - states expire after no activity)
      */
-    protected int $ttl = 7200;
+    protected int $ttl = 86400;
 
     /**
      * Get the cached state for an entry.

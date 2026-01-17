@@ -17,8 +17,16 @@ export default class Workspace {
         // Unique ID for this window/tab to distinguish from same user in other windows
         this.windowId = this.generateWindowId();
 
+        // Track all active windows (not just users) for proper broadcast logic
+        this.activeWindows = new Set();
+
         // Track which changes came from broadcasts (to avoid re-broadcasting)
         this.applyingBroadcast = false;
+
+        // Inactivity tracking (12 hours = 43200000ms)
+        this.inactivityTimeout = 12 * 60 * 60 * 1000;
+        this.inactivityTimer = null;
+        this.inactivityWarningShown = false;
 
         this.debouncedBroadcastValueChangeFuncsByHandle = {};
         this.debouncedBroadcastMetaChangeFuncsByHandle = {};
@@ -51,10 +59,16 @@ export default class Workspace {
     }
 
     destroy() {
-        // If we're the last user, clear the cached state
-        if (this.isAlone()) {
-            this.clearCachedState();
-        }
+        // Clear inactivity timer
+        this.clearActivityTimer();
+
+        // Announce that this window is leaving
+        this.channel.whisper('window-left', { windowId: this.windowId });
+
+        // Remove ourselves from active windows
+        this.activeWindows.delete(this.windowId);
+
+        // State is not cleared here - it expires after 24 hours of inactivity via server TTL
 
         this.storeSubscriber.apply();
         this.echo.leave(this.channelName);
@@ -69,10 +83,79 @@ export default class Workspace {
             this.subscribeToVuexMutations();
             Statamic.$store.commit(`collaboration/${this.channelName}/setUsers`, users);
 
-            // If we're the only user, try to load cached state from the server
-            if (users.length === 1) {
-                await this.loadCachedState();
-            }
+            // Register our own window
+            this.activeWindows.add(this.windowId);
+
+            // Start inactivity timer
+            this.resetActivityTimer();
+
+            // Always load cached state first (handles reconnects and stale data)
+            await this.loadCachedState();
+
+            // Announce our window to others (they will respond with window-present and fresh state)
+            this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
+        });
+
+        // Listen for other windows joining
+        this.listenForWhisper('window-joined', ({ windowId, user }) => {
+            if (windowId === this.windowId) return;
+
+            this.debug(`Window joined: ${windowId}`, { user });
+            this.activeWindows.add(windowId);
+
+            // Respond so the new window knows about us
+            this.channel.whisper('window-present', { windowId: this.windowId, user: this.user });
+
+            // Send current state to the new window
+            this.channel.whisper(`initialize-state-for-window-${windowId}`, {
+                values: Statamic.$store.state.publish[this.container.name].values,
+                meta: this.cleanEntireMetaPayload(Statamic.$store.state.publish[this.container.name].meta),
+                focus: Statamic.$store.state.collaboration[this.channelName].focus,
+                fromWindowId: this.windowId,
+            });
+        });
+
+        // Listen for existing windows announcing themselves
+        this.listenForWhisper('window-present', ({ windowId, user }) => {
+            if (windowId === this.windowId) return;
+
+            this.debug(`Window present: ${windowId}`, { user });
+            this.activeWindows.add(windowId);
+        });
+
+        // Listen for windows leaving
+        this.listenForWhisper('window-left', ({ windowId }) => {
+            this.debug(`Window left: ${windowId}`);
+            this.activeWindows.delete(windowId);
+        });
+
+        // Listen for initial state from other windows (targeted to our windowId)
+        // This always merges state since other windows may have fresher data than cached state
+        this.listenForWhisper(`initialize-state-for-window-${this.windowId}`, payload => {
+            this.debug('✅ Applying/merging state from another window', payload);
+
+            // Merge values with current state
+            const currentValues = Statamic.$store.state.publish[this.container.name].values;
+            const mergedValues = { ...currentValues, ...payload.values };
+            Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
+
+            // Merge meta with current state
+            const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
+            const restoredMeta = this.restoreEntireMetaPayload(payload.meta);
+            const mergedMeta = { ...currentMeta };
+            Object.keys(restoredMeta).forEach(handle => {
+                mergedMeta[handle] = { ...currentMeta[handle], ...restoredMeta[handle] };
+            });
+            Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
+
+            // Apply focus locks from other windows
+            _.each(payload.focus, ({ user, handle }) => {
+                if (user.id !== this.user.id) {
+                    this.focusAndLock(user, handle);
+                }
+            });
+
+            this.initialStateUpdated = true;
         });
 
         this.channel.joining(user => {
@@ -85,14 +168,7 @@ export default class Workspace {
                     this.playAudio('buddy-in');
                 }
             }
-
-            // Send current state to the joining user/window
-            this.whisper(`initialize-state-for-${user.id}`, {
-                values: Statamic.$store.state.publish[this.container.name].values,
-                meta: this.cleanEntireMetaPayload(Statamic.$store.state.publish[this.container.name].meta),
-                focus: Statamic.$store.state.collaboration[this.channelName].focus,
-                fromWindowId: this.windowId,
-            });
+            // Note: State initialization is now handled via window-joined/window-present whispers
         });
 
         this.channel.leaving(user => {
@@ -115,15 +191,6 @@ export default class Workspace {
 
         this.listenForWhisper('meta-updated', e => {
             this.applyBroadcastedMetaChange(e);
-        });
-
-        this.listenForWhisper(`initialize-state-for-${this.user.id}`, payload => {
-            if (this.initialStateUpdated) return;
-            this.debug('✅ Applying broadcasted state change', payload);
-            Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, payload.values);
-            Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, this.restoreEntireMetaPayload(payload.meta));
-            _.each(payload.focus, ({ user, handle }) => this.focusAndLock(user, handle));
-            this.initialStateUpdated = true;
         });
 
         this.listenForWhisper('focus', ({ user, handle, windowId }) => {
@@ -239,33 +306,27 @@ export default class Workspace {
     }
 
     initializeHooks() {
-        Statamic.$hooks.on('entry.saved', async (resolve, reject, { reference }) => {
+        Statamic.$hooks.on('entry.saved', (resolve, reject, { reference }) => {
             if (reference === this.container.reference) {
                 // Force whisper to notify all windows (including own other windows)
                 this.whisper('saved', { user: this.user, windowId: this.windowId }, { force: true });
-                // Clear cached state since entry has been saved
-                await this.clearCachedState();
             }
             resolve();
         });
 
-        Statamic.$hooks.on('entry.published', async (resolve, reject, { reference, message }) => {
+        Statamic.$hooks.on('entry.published', (resolve, reject, { reference, message }) => {
             if (reference === this.container.reference) {
                 // Force whisper to notify all windows (including own other windows)
                 this.whisper('published', { user: this.user, message, windowId: this.windowId }, { force: true });
-                // Clear cached state since entry has been published
-                await this.clearCachedState();
             }
             resolve();
         });
 
-        Statamic.$hooks.on('revision.restored', async (resolve, reject, { reference }) => {
+        Statamic.$hooks.on('revision.restored', (resolve, reject, { reference }) => {
             if (reference !== this.container.reference) return resolve();
 
             // Force whisper to notify all windows (including own other windows)
             this.whisper('revision-restored', { user: this.user, windowId: this.windowId }, { force: true });
-            // Clear cached state since revision has been restored
-            await this.clearCachedState();
 
             // Echo doesn't give us a promise, so wait half a second before resolving.
             // That should be enough time for the whisper to be sent before the the page refreshes.
@@ -332,6 +393,9 @@ export default class Workspace {
 
         this.rememberValueChange(payload.handle, payload.value);
 
+        // Reset inactivity timer on any change
+        this.resetActivityTimer();
+
         // Only broadcast and persist if this change originated from THIS window
         if (!this.applyingBroadcast) {
             this.debouncedBroadcastValueChangeFuncByHandle(payload.handle)(payload);
@@ -355,6 +419,9 @@ export default class Workspace {
         }
 
         this.rememberMetaChange(payload.handle, payload.value);
+
+        // Reset inactivity timer on any change
+        this.resetActivityTimer();
 
         // Only broadcast and persist if this change originated from THIS window
         if (!this.applyingBroadcast) {
@@ -501,7 +568,8 @@ export default class Workspace {
     }
 
     isAlone() {
-        return Statamic.$store.state.collaboration[this.channelName].users.length === 1;
+        // Check if this is the only window (not just the only user)
+        return this.activeWindows.size <= 1;
     }
 
     whisper(event, payload, { force = false } = {}) {
@@ -689,5 +757,48 @@ export default class Workspace {
         } catch (error) {
             this.debug('Failed to clear cached state', { error });
         }
+    }
+
+    resetActivityTimer() {
+        // Clear existing timer
+        if (this.inactivityTimer) {
+            clearTimeout(this.inactivityTimer);
+        }
+
+        // Reset warning state
+        this.inactivityWarningShown = false;
+
+        // Start new timer
+        this.inactivityTimer = setTimeout(() => {
+            this.showInactivityWarning();
+        }, this.inactivityTimeout);
+
+        this.debug('Activity timer reset');
+    }
+
+    clearActivityTimer() {
+        if (this.inactivityTimer) {
+            clearTimeout(this.inactivityTimer);
+            this.inactivityTimer = null;
+        }
+    }
+
+    showInactivityWarning() {
+        if (this.inactivityWarningShown) return;
+
+        this.inactivityWarningShown = true;
+
+        Statamic.$components.append('CollaborationBlockingNotification', {
+            props: {
+                title: 'Inaktivitet',
+                message: 'Der har ikke været aktivitet i 12 timer. Luk venligst dette indhold for at undgå konflikter.',
+                confirmText: 'Luk indhold'
+            }
+        }).on('confirm', () => {
+            // Navigate away or close
+            window.location.href = Statamic.$config.get('cpUrl') || '/cp';
+        });
+
+        this.debug('⚠️ Inactivity warning shown after 12 hours');
     }
 }
