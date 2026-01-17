@@ -48,7 +48,21 @@ export default class Workspace {
         this.initializeValuesAndMeta();
         this.initializeHooks();
         this.initializeStatusBar();
+        this.initializeVisibilityHandler();
         this.started = true;
+    }
+
+    initializeVisibilityHandler() {
+        this.visibilityHandler = async () => {
+            if (document.visibilityState === 'visible') {
+                this.debug('👁️ Window became visible, syncing state...');
+                await this.loadCachedState();
+                // Re-announce ourselves to get fresh state from other windows
+                this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
+            }
+        };
+
+        document.addEventListener('visibilitychange', this.visibilityHandler);
     }
 
     initializeStateApi() {
@@ -61,6 +75,11 @@ export default class Workspace {
     destroy() {
         // Clear inactivity timer
         this.clearActivityTimer();
+
+        // Remove visibility handler
+        if (this.visibilityHandler) {
+            document.removeEventListener('visibilitychange', this.visibilityHandler);
+        }
 
         // Announce that this window is leaving
         this.channel.whisper('window-left', { windowId: this.windowId });
