@@ -5,6 +5,8 @@ namespace Statamic\Collaboration;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
 use Illuminate\Support\Facades\Cache;
+use Statamic\Facades\Entry;
+use Statamic\Facades\User;
 
 class StateController extends Controller
 {
@@ -18,6 +20,10 @@ class StateController extends Controller
      */
     public function show(Request $request, string $reference, string $site)
     {
+        if (! $this->userCanEditEntry($reference)) {
+            abort(403);
+        }
+
         $key = $this->cacheKey($reference, $site);
 
         $state = Cache::get($key);
@@ -42,6 +48,10 @@ class StateController extends Controller
      */
     public function update(Request $request, string $reference, string $site)
     {
+        if (! $this->userCanEditEntry($reference)) {
+            abort(403);
+        }
+
         $key = $this->cacheKey($reference, $site);
 
         $validated = $request->validate([
@@ -57,7 +67,7 @@ class StateController extends Controller
         } else {
             // For meta, merge with existing to preserve __collaboration keys
             $existingMeta = $state['meta'][$validated['handle']] ?? [];
-            $state['meta'][$validated['handle']] = array_merge($existingMeta, $validated['value'] ?? []);
+            $state['meta'][$validated['handle']] = [...$existingMeta, ...($validated['value'] ?? [])];
         }
 
         Cache::put($key, $state, $this->ttl);
@@ -70,11 +80,38 @@ class StateController extends Controller
      */
     public function destroy(Request $request, string $reference, string $site)
     {
+        if (! $this->userCanEditEntry($reference)) {
+            abort(403);
+        }
+
         $key = $this->cacheKey($reference, $site);
 
         Cache::forget($key);
 
         return response()->json(['success' => true]);
+    }
+
+    /**
+     * Check if the current user can edit the entry.
+     */
+    protected function userCanEditEntry(string $reference): bool
+    {
+        // Normalize reference (replace . back to :: for Statamic)
+        $normalizedRef = str_replace('.', '::', $reference);
+
+        $entry = Entry::find($normalizedRef);
+
+        if (! $entry) {
+            return false;
+        }
+
+        $user = User::current();
+
+        if (! $user) {
+            return false;
+        }
+
+        return $user->can('edit', $entry);
     }
 
     /**
