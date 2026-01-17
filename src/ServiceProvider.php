@@ -3,6 +3,7 @@
 namespace Statamic\Collaboration;
 
 use Illuminate\Support\Facades\Broadcast;
+use Illuminate\Support\Facades\Route;
 use Statamic\Facades\User;
 use Statamic\Providers\AddonServiceProvider;
 use Statamic\Statamic;
@@ -19,6 +20,31 @@ class ServiceProvider extends AddonServiceProvider
     {
         Statamic::provideToScript(['collaboration' => config('collaboration')]);
 
+        $this->registerRoutes();
+        $this->registerBroadcastChannel();
+    }
+
+    protected function registerRoutes()
+    {
+        Route::middleware(['web', 'statamic.cp.authenticated'])
+            ->prefix(config('statamic.cp.route', 'cp'))
+            ->group(function () {
+                Route::get('collaboration/state/{reference}/{site}', [StateController::class, 'show'])
+                    ->name('collaboration.state.show')
+                    ->where('reference', '.*');
+
+                Route::post('collaboration/state/{reference}/{site}', [StateController::class, 'update'])
+                    ->name('collaboration.state.update')
+                    ->where('reference', '.*');
+
+                Route::delete('collaboration/state/{reference}/{site}', [StateController::class, 'destroy'])
+                    ->name('collaboration.state.destroy')
+                    ->where('reference', '.*');
+            });
+    }
+
+    protected function registerBroadcastChannel()
+    {
         Broadcast::channel('entry.{id}.{site}', function ($user, $id, $site) {
             $user = User::fromUser($user);
 
