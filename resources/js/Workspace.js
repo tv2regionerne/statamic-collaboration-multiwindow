@@ -505,7 +505,7 @@ export default class Workspace {
         return JSON.stringify(lastValue) !== JSON.stringify(newValue);
     }
 
-    broadcastValueChange(payload) {
+    async broadcastValueChange(payload) {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
         if (this.applyingBroadcast) return;
 
@@ -516,7 +516,9 @@ export default class Workspace {
 
             // If payload is larger than 3KB, tell others to fetch from server instead
             if (payloadSize > 3000) {
-                this.debug(`📦 Payload too large (${payloadSize} bytes), sending fetch notification`);
+                this.debug(`📦 Payload too large (${payloadSize} bytes), persisting and sending fetch notification`);
+                // Persist immediately (not debounced) so it's available when others fetch
+                await this.sendStateUpdate(payload.handle, payload.value, 'value');
                 this.whisper('fetch-field', { handle: payload.handle, type: 'value', windowId: this.windowId });
             } else {
                 this.whisper('updated', fullPayload);
@@ -524,7 +526,7 @@ export default class Workspace {
         }
     }
 
-    broadcastMetaChange(payload) {
+    async broadcastMetaChange(payload) {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
         if (this.applyingBroadcast) return;
 
@@ -535,7 +537,9 @@ export default class Workspace {
 
             // If payload is larger than 3KB, tell others to fetch from server instead
             if (payloadSize > 3000) {
-                this.debug(`📦 Meta payload too large (${payloadSize} bytes), sending fetch notification`);
+                this.debug(`📦 Meta payload too large (${payloadSize} bytes), persisting and sending fetch notification`);
+                // Persist immediately (not debounced) so it's available when others fetch
+                await this.sendStateUpdate(payload.handle, payload.value, 'meta');
                 this.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
             } else {
                 this.whisper('meta-updated', cleanedPayload);
