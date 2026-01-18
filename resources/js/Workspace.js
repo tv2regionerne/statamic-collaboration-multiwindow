@@ -43,6 +43,11 @@ export default class Workspace {
         // Toast notification flags (to avoid duplicate toasts)
         this.notSavedToastShown = false;
         this.unsavedToastShown = false;
+
+        // Warm-up period: always broadcast for first few seconds after joining
+        // This ensures sync works even before activeWindows is fully populated
+        this.warmUpPeriod = true;
+        this.warmUpDurationMs = 5000;
     }
 
     generateWindowId() {
@@ -198,6 +203,13 @@ export default class Workspace {
 
             // Start inactivity timer
             this.resetActivityTimer();
+
+            // Start warm-up period (always broadcast during this time)
+            this.warmUpPeriod = true;
+            setTimeout(() => {
+                this.warmUpPeriod = false;
+                this.debug('🔥 Warm-up period ended');
+            }, this.warmUpDurationMs);
 
             // Always load cached state first (handles reconnects and stale data)
             await this.loadCachedState('channel.here');
@@ -828,6 +840,12 @@ export default class Workspace {
     }
 
     isAlone() {
+        // During warm-up period, assume we're not alone (ensures sync works while windows are joining)
+        if (this.warmUpPeriod) {
+            this.debug('isAlone check: in warm-up period, returning false');
+            return false;
+        }
+
         // Check if this is the only window (not just the only user)
         // Also check users from presence channel as fallback
         const users = Statamic.$store.state.collaboration[this.channelName]?.users || [];
