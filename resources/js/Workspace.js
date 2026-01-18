@@ -157,50 +157,28 @@ export default class Workspace {
         document.addEventListener('visibilitychange', this.visibilityHandler);
     }
 
-    /**
-     * Wait for the WebSocket connection to be in a connected state.
-     * Returns immediately if already connected, otherwise waits up to 5 seconds.
-     */
     async waitForConnection(maxWaitMs = 5000) {
-        const connector = this.echo?.connector;
-        if (!connector?.pusher) {
-            this.debug('⚠️ No pusher connector available');
-            return { wasDisconnected: false };
-        }
+        const pusher = this.echo?.connector?.pusher;
+        if (!pusher) return { wasDisconnected: false };
 
-        const pusher = connector.pusher;
-        const state = pusher.connection?.state;
+        if (pusher.connection?.state === 'connected') return { wasDisconnected: false };
 
-        if (state === 'connected') {
-            this.debug('✅ Connection already active');
-            return { wasDisconnected: false };
-        }
-
-        this.debug(`🔄 Connection state: ${state}, waiting for reconnection...`);
+        this.debug(`🔄 Waiting for reconnection...`);
 
         return new Promise((resolve) => {
-            const startTime = Date.now();
+            const timeout = setTimeout(() => {
+                this.debug(`⚠️ Connection timeout`);
+                resolve({ wasDisconnected: true, reconnected: false });
+            }, maxWaitMs);
 
-            const checkConnection = () => {
-                const currentState = pusher.connection?.state;
-
-                if (currentState === 'connected') {
+            const checkInterval = setInterval(() => {
+                if (pusher.connection?.state === 'connected') {
+                    clearTimeout(timeout);
+                    clearInterval(checkInterval);
                     this.debug('✅ Connection restored');
                     resolve({ wasDisconnected: true, reconnected: true });
-                    return;
                 }
-
-                if (Date.now() - startTime > maxWaitMs) {
-                    this.debug(`⚠️ Connection timeout after ${maxWaitMs}ms, proceeding anyway`);
-                    resolve({ wasDisconnected: true, reconnected: false });
-                    return;
-                }
-
-                // Check again in 100ms
-                setTimeout(checkConnection, 100);
-            };
-
-            checkConnection();
+            }, 100);
         });
     }
 
@@ -626,13 +604,13 @@ export default class Workspace {
             applyingBroadcast: this.applyingBroadcast,
             valueEnd: valuePreview
         });
-        if (!this.valueHasChanged(payload.handle, payload.value)) {
+        if (!this.hasChanged('value', payload.handle, payload.value)) {
             // No change? Don't bother doing anything.
             this.debug(`Value for ${payload.handle} has not changed.`);
             return;
         }
 
-        this.rememberValueChange(payload.handle, payload.value);
+        this.rememberChange('value', payload.handle, payload.value);
 
         // Update save status based on whether values differ from original
         this.updateSaveStatus();
@@ -661,13 +639,13 @@ export default class Workspace {
     // or by the workspace applying a change dispatched by another user editing something.
     vuexFieldMetaHasBeenSet(payload) {
         this.debug('Vuex field meta has been set', payload);
-        if (!this.metaHasChanged(payload.handle, payload.value)) {
+        if (!this.hasChanged('meta', payload.handle, payload.value)) {
             // No change? Don't bother doing anything.
             this.debug(`Meta for ${payload.handle} has not changed.`, { value: payload.value, lastValue: this.lastMetaValues[payload.handle] });
             return;
         }
 
-        this.rememberMetaChange(payload.handle, payload.value);
+        this.rememberChange('meta', payload.handle, payload.value);
 
         // Reset inactivity timer on any change
         this.resetActivityTimer();
@@ -683,47 +661,36 @@ export default class Workspace {
         }
     }
 
-    rememberValueChange(handle, value) {
-        this.debug('Remembering value change', { handle, value });
-        this.lastValues[handle] = clone(value);
+    rememberChange(type, handle, value) {
+        this.debug(`Remembering ${type} change`, { handle, value });
+        const cache = type === 'value' ? this.lastValues : this.lastMetaValues;
+        cache[handle] = clone(value);
     }
 
-    rememberMetaChange(handle, value) {
-        this.debug('Remembering meta change', { handle, value });
-        this.lastMetaValues[handle] = clone(value);
+    getOrCreateDebouncedFunc(cache, handle, callback, delay) {
+        if (!cache[handle]) {
+            cache[handle] = _.debounce(callback, delay);
+        }
+        return cache[handle];
     }
 
     debouncedBroadcastValueChangeFuncByHandle(handle) {
-        // use existing debounced function if one already exists
-        const func = this.debouncedBroadcastValueChangeFuncsByHandle[handle];
-        if (func) return func;
-
-        // if the handle has no debounced broadcast function yet, create one and return it
-        this.debouncedBroadcastValueChangeFuncsByHandle[handle] = _.debounce((payload) => {
-            this.broadcastValueChange(payload);
-        }, 500);
-        return this.debouncedBroadcastValueChangeFuncsByHandle[handle];
+        return this.getOrCreateDebouncedFunc(
+            this.debouncedBroadcastValueChangeFuncsByHandle, handle,
+            (payload) => this.broadcastValueChange(payload), 500
+        );
     }
 
     debouncedBroadcastMetaChangeFuncByHandle(handle) {
-        // use existing debounced function if one already exists
-        const func = this.debouncedBroadcastMetaChangeFuncsByHandle[handle];
-        if (func) return func;
-
-        // if the handle has no debounced broadcast function yet, create one and return it
-        this.debouncedBroadcastMetaChangeFuncsByHandle[handle] = _.debounce((payload) => {
-            this.broadcastMetaChange(payload);
-        }, 500);
-        return this.debouncedBroadcastMetaChangeFuncsByHandle[handle];
+        return this.getOrCreateDebouncedFunc(
+            this.debouncedBroadcastMetaChangeFuncsByHandle, handle,
+            (payload) => this.broadcastMetaChange(payload), 500
+        );
     }
 
-    valueHasChanged(handle, newValue) {
-        const lastValue = this.lastValues[handle] || null;
-        return JSON.stringify(lastValue) !== JSON.stringify(newValue);
-    }
-
-    metaHasChanged(handle, newValue) {
-        const lastValue = this.lastMetaValues[handle] || null;
+    hasChanged(type, handle, newValue) {
+        const cache = type === 'value' ? this.lastValues : this.lastMetaValues;
+        const lastValue = cache[handle] || null;
         return JSON.stringify(lastValue) !== JSON.stringify(newValue);
     }
 
@@ -928,7 +895,7 @@ export default class Workspace {
             const chunk = {
                 id: msgId,
                 index: i,
-                chunk: str.substr(i * chunkSize, chunkSize),
+                chunk: str.slice(i * chunkSize, (i + 1) * chunkSize),
                 final: chunkSize * (i + 1) >= str.length
             };
             this.debug(`📣 Broadcasting "${event}"`, chunk);
@@ -956,22 +923,13 @@ export default class Workspace {
     }
 
     playAudio(file) {
-        let el = document.createElement('audio');
-        el.src = this.getViteAudioFile(file);
-        document.body.appendChild(el);
+        const audioFiles = { 'buddy-in': buddyIn, 'buddy-out': buddyOut };
+        const el = document.createElement('audio');
+        el.src = audioFiles[file];
         el.volume = 0.25;
         el.addEventListener('ended', () => el.remove());
+        document.body.appendChild(el);
         el.play();
-    }
-
-    getViteAudioFile(file) {
-        if (file === 'buddy-in') {
-            return buddyIn;
-        } else if (file === 'buddy-out') {
-            return buddyOut;
-        }
-
-        console.error('audio not found');
     }
 
     initializeValuesAndMeta() {
@@ -1082,23 +1040,17 @@ export default class Workspace {
     }
 
     debouncedPersistValueFuncByHandle(handle) {
-        const func = this.debouncedPersistValueFuncsByHandle[handle];
-        if (func) return func;
-
-        this.debouncedPersistValueFuncsByHandle[handle] = _.debounce(async (payload) => {
-            await this.sendStateUpdate(payload.handle, payload.value, 'value');
-        }, 1000);
-        return this.debouncedPersistValueFuncsByHandle[handle];
+        return this.getOrCreateDebouncedFunc(
+            this.debouncedPersistValueFuncsByHandle, handle,
+            (payload) => this.sendStateUpdate(payload.handle, payload.value, 'value'), 1000
+        );
     }
 
     debouncedPersistMetaFuncByHandle(handle) {
-        const func = this.debouncedPersistMetaFuncsByHandle[handle];
-        if (func) return func;
-
-        this.debouncedPersistMetaFuncsByHandle[handle] = _.debounce(async (payload) => {
-            await this.sendStateUpdate(payload.handle, payload.value, 'meta');
-        }, 1000);
-        return this.debouncedPersistMetaFuncsByHandle[handle];
+        return this.getOrCreateDebouncedFunc(
+            this.debouncedPersistMetaFuncsByHandle, handle,
+            (payload) => this.sendStateUpdate(payload.handle, payload.value, 'meta'), 1000
+        );
     }
 
     async sendStateUpdate(handle, value, type) {
