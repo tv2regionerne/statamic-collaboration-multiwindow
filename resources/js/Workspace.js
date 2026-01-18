@@ -31,6 +31,10 @@ export default class Workspace {
         // Prevent concurrent loadCachedState calls
         this.loadingCachedState = false;
 
+        // Track when we last made a local change (to avoid overwriting recent edits)
+        this.lastLocalChangeTime = 0;
+        this.localChangeProtectionMs = 3000; // Don't overwrite if changed within last 3 seconds
+
         this.debouncedBroadcastValueChangeFuncsByHandle = {};
         this.debouncedBroadcastMetaChangeFuncsByHandle = {};
         this.debouncedPersistValueFuncsByHandle = {};
@@ -461,6 +465,8 @@ export default class Workspace {
 
         // Only broadcast and persist if this change originated from THIS window
         if (!this.applyingBroadcast) {
+            // Track when we made this local change
+            this.lastLocalChangeTime = Date.now();
             this.debug(`📤 Will broadcast change for ${payload.handle}`);
             this.debouncedBroadcastValueChangeFuncByHandle(payload.handle)(payload);
 
@@ -764,6 +770,14 @@ export default class Workspace {
             this.debug(`🔄 loadCachedState already in progress, skipping call from: ${source}`);
             return;
         }
+
+        // Don't overwrite if user has made recent local changes (protects against losing typing)
+        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
+        if (source === 'fetch-field listener' && timeSinceLastChange < this.localChangeProtectionMs) {
+            this.debug(`🛡️ Skipping loadCachedState - local change was ${timeSinceLastChange}ms ago (protection: ${this.localChangeProtectionMs}ms)`);
+            return;
+        }
+
         this.loadingCachedState = true;
         this.debug(`🔄 loadCachedState called from: ${source}`);
 
