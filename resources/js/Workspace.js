@@ -427,7 +427,12 @@ export default class Workspace {
 
     initializeConnectionMonitoring() {
         // Get the underlying Pusher/Socket connection
-        const connector = this.echo.connector;
+        const connector = this.echo?.connector;
+
+        if (!connector) {
+            this.debug('⚠️ Connection monitoring not available - no connector');
+            return;
+        }
 
         if (connector.pusher) {
             // Pusher-based connection (Pusher, Reverb, Soketi, etc.)
