@@ -46,7 +46,12 @@ export default class Workspace {
     }
 
     generateWindowId() {
-        return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        const timestamp = Date.now().toString(36);
+        const randomPart = crypto.getRandomValues(new Uint32Array(2))
+            .reduce((acc, val) => acc + val.toString(36), '')
+            .slice(0, 9);
+
+        return `${timestamp}-${randomPart}`;
     }
 
     start() {
@@ -80,15 +85,75 @@ export default class Workspace {
             if (isNowVisible && this.wasHidden) {
                 this.wasHidden = false;
                 this.debug('👁️ Window became visible after being hidden, syncing state...');
+
+                // Wait for WebSocket connection to be ready before syncing
+                const { wasDisconnected, reconnected } = await this.waitForConnection();
+
+                // Fetch latest state from server
                 await this.loadCachedState('visibilityHandler');
+
                 // Re-announce ourselves to get fresh state from other windows
                 this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
+
+                // Show toast if we had to reconnect
+                if (wasDisconnected && reconnected) {
+                    Statamic.$toast.success('Connection restored. Syncing latest changes...', { duration: 2000 });
+                } else if (wasDisconnected && !reconnected) {
+                    Statamic.$toast.error('Connection could not be restored. Please refresh the page.', { duration: false });
+                }
             } else if (isNowVisible) {
                 this.debug('👁️ Visibility event fired but window was not hidden, skipping sync');
             }
         };
 
         document.addEventListener('visibilitychange', this.visibilityHandler);
+    }
+
+    /**
+     * Wait for the WebSocket connection to be in a connected state.
+     * Returns immediately if already connected, otherwise waits up to 5 seconds.
+     */
+    async waitForConnection(maxWaitMs = 5000) {
+        const connector = this.echo?.connector;
+        if (!connector?.pusher) {
+            this.debug('⚠️ No pusher connector available');
+            return { wasDisconnected: false };
+        }
+
+        const pusher = connector.pusher;
+        const state = pusher.connection?.state;
+
+        if (state === 'connected') {
+            this.debug('✅ Connection already active');
+            return { wasDisconnected: false };
+        }
+
+        this.debug(`🔄 Connection state: ${state}, waiting for reconnection...`);
+
+        return new Promise((resolve) => {
+            const startTime = Date.now();
+
+            const checkConnection = () => {
+                const currentState = pusher.connection?.state;
+
+                if (currentState === 'connected') {
+                    this.debug('✅ Connection restored');
+                    resolve({ wasDisconnected: true, reconnected: true });
+                    return;
+                }
+
+                if (Date.now() - startTime > maxWaitMs) {
+                    this.debug(`⚠️ Connection timeout after ${maxWaitMs}ms, proceeding anyway`);
+                    resolve({ wasDisconnected: true, reconnected: false });
+                    return;
+                }
+
+                // Check again in 100ms
+                setTimeout(checkConnection, 100);
+            };
+
+            checkConnection();
+        });
     }
 
     initializeStateApi() {
@@ -349,7 +414,7 @@ export default class Workspace {
         // Detect if this is a new entry (not yet saved)
         // New entries typically have 'create' in the reference or no valid ID
         const isNewEntry = this.container.reference.includes('create') ||
-                          !this.container.reference.match(/[a-f0-9-]{36}$/i);
+            !this.container.reference.match(/[a-f0-9-]{36}$/i);
 
         Statamic.$store.registerModule(['collaboration', this.channelName], {
             namespaced: true,
@@ -689,7 +754,7 @@ export default class Workspace {
     // whole thing, which would be wasted bytes in the message.
     cleanMetaPayload(payload) {
         const allowed = data_get(payload, 'value.__collaboration');
-        if (! allowed) return payload;
+        if (!allowed) return payload;
         let allowedValues = {};
         allowed.forEach(key => allowedValues[key] = payload.value[key]);
         payload.value = allowedValues;
@@ -711,7 +776,7 @@ export default class Workspace {
 
     restoreEntireMetaPayload(payload) {
         return _.mapObject(payload, (value, key) => {
-            return {...this.lastMetaValues[key], ...value};
+            return { ...this.lastMetaValues[key], ...value };
         });
     }
 
@@ -745,7 +810,7 @@ export default class Workspace {
 
         this.debug('✅ Applying broadcasted meta change', payload);
 
-        let value = {...this.lastMetaValues[payload.handle], ...payload.value};
+        let value = { ...this.lastMetaValues[payload.handle], ...payload.value };
         payload.value = value;
 
         // Mark that we're applying a broadcast to prevent re-broadcasting
@@ -759,7 +824,7 @@ export default class Workspace {
 
     debug(message, args) {
         if (!Statamic.$config.get('collaboration.debug')) return;
-        console.log(`[Collaboration ${this.windowId?.slice(-6) || 'init'}]`, message, {...args});
+        console.log(`[Collaboration ${this.windowId?.slice(-6) || 'init'}]`, message, { ...args });
     }
 
     isAlone() {
@@ -809,7 +874,7 @@ export default class Workspace {
 
         let events = {};
         this.channel.listenForWhisper(`chunked-${event}`, data => {
-            if (! events.hasOwnProperty(data.id)) {
+            if (!events.hasOwnProperty(data.id)) {
                 events[data.id] = { chunks: [], receivedFinal: false };
             }
 
