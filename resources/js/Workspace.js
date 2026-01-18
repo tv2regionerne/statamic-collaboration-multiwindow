@@ -56,7 +56,7 @@ export default class Workspace {
         this.visibilityHandler = async () => {
             if (document.visibilityState === 'visible') {
                 this.debug('👁️ Window became visible, syncing state...');
-                await this.loadCachedState();
+                await this.loadCachedState('visibilityHandler');
                 // Re-announce ourselves to get fresh state from other windows
                 this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
             }
@@ -109,7 +109,7 @@ export default class Workspace {
             this.resetActivityTimer();
 
             // Always load cached state first (handles reconnects and stale data)
-            await this.loadCachedState();
+            await this.loadCachedState('channel.here');
 
             // Announce our window to others (they will respond with window-present and fresh state)
             this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
@@ -223,7 +223,7 @@ export default class Workspace {
             }
 
             this.debug(`📥 Fetching ${type} for "${handle}" from server (large payload)`);
-            this.loadCachedState(); // Reload all state from server
+            this.loadCachedState('fetch-field listener'); // Reload all state from server
         });
 
         this.listenForWhisper('meta-updated', e => {
@@ -725,7 +725,8 @@ export default class Workspace {
         this.lastMetaValues = clone(Statamic.$store.state.publish[this.container.name].meta);
     }
 
-    async loadCachedState() {
+    async loadCachedState(source = 'unknown') {
+        this.debug(`🔄 loadCachedState called from: ${source}`);
         try {
             const response = await fetch(this.stateApiUrl, {
                 headers: {
