@@ -216,7 +216,11 @@ export default class Workspace {
 
         // Handle large payloads - fetch from server instead of receiving via WebSocket
         this.channel.listenForWhisper('fetch-field', ({ handle, type, windowId }) => {
-            if (windowId === this.windowId) return;
+            this.debug(`📥 Received fetch-field from ${windowId?.slice(-6)}, my windowId: ${this.windowId?.slice(-6)}`);
+            if (windowId === this.windowId) {
+                this.debug(`📥 Skipping own fetch-field`);
+                return;
+            }
 
             this.debug(`📥 Fetching ${type} for "${handle}" from server (large payload)`);
             this.loadCachedState(); // Reload all state from server
@@ -417,10 +421,10 @@ export default class Workspace {
     // It could have been triggered by the current user editing something,
     // or by the workspace applying a change dispatched by another user editing something.
     vuexFieldValueHasBeenSet(payload) {
-        this.debug('Vuex field value has been set', payload);
+        this.debug('Vuex field value has been set', { handle: payload.handle, user: payload.user, applyingBroadcast: this.applyingBroadcast });
         if (!this.valueHasChanged(payload.handle, payload.value)) {
             // No change? Don't bother doing anything.
-            this.debug(`Value for ${payload.handle} has not changed.`, { value: payload.value, lastValue: this.lastValues[payload.handle] });
+            this.debug(`Value for ${payload.handle} has not changed.`);
             return;
         }
 
@@ -431,12 +435,15 @@ export default class Workspace {
 
         // Only broadcast and persist if this change originated from THIS window
         if (!this.applyingBroadcast) {
+            this.debug(`📤 Will broadcast change for ${payload.handle}`);
             this.debouncedBroadcastValueChangeFuncByHandle(payload.handle)(payload);
 
             // Persist to server cache (only for our own changes from this window)
             if (this.user.id == payload.user) {
                 this.persistValueChange(payload.handle, payload.value);
             }
+        } else {
+            this.debug(`🚫 Not broadcasting - applyingBroadcast is true`);
         }
     }
 
@@ -513,7 +520,10 @@ export default class Workspace {
 
     async broadcastValueChange(payload) {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
-        if (this.applyingBroadcast) return;
+        if (this.applyingBroadcast) {
+            this.debug(`🚫 Skipping broadcast - applyingBroadcast is true`);
+            return;
+        }
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
@@ -617,7 +627,7 @@ export default class Workspace {
     }
 
     debug(message, args) {
-        console.log('[Collaboration]', message, {...args});
+        console.log(`[Collaboration ${this.windowId?.slice(-6) || 'init'}]`, message, {...args});
     }
 
     isAlone() {
@@ -727,13 +737,16 @@ export default class Workspace {
             this.debug('✅ Applying cached state from server', data);
 
             // Mark that we're applying external data to prevent re-broadcasting
+            this.debug('🔒 Setting applyingBroadcast = true');
             this.applyingBroadcast = true;
             try {
                 // Apply cached values - merge with current values
                 if (data.values && Object.keys(data.values).length > 0) {
                     const currentValues = Statamic.$store.state.publish[this.container.name].values;
                     const mergedValues = { ...currentValues, ...data.values };
+                    this.debug('📝 Dispatching setValues...');
                     await Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
+                    this.debug('📝 setValues dispatch completed');
                 }
 
                 // Apply cached meta - merge with current meta
@@ -746,6 +759,7 @@ export default class Workspace {
                     await Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
                 }
             } finally {
+                this.debug('🔓 Setting applyingBroadcast = false');
                 this.applyingBroadcast = false;
             }
 
