@@ -48,6 +48,10 @@ export default class Workspace {
         // This ensures sync works even before activeWindows is fully populated
         this.warmUpPeriod = true;
         this.warmUpDurationMs = 5000;
+
+        // BroadcastChannel for reliable same-browser window detection
+        this.localChannel = null;
+        this.localWindows = new Set();
     }
 
     generateWindowId() {
@@ -63,6 +67,7 @@ export default class Workspace {
         if (this.started) return;
 
         this.initializeStateApi();
+        this.initializeLocalChannel();
         this.initializeEcho();
         this.initializeStore();
         this.initializeFocus();
@@ -71,6 +76,44 @@ export default class Workspace {
         this.initializeStatusBar();
         this.initializeVisibilityHandler();
         this.started = true;
+    }
+
+    /**
+     * Initialize BroadcastChannel for reliable same-browser window detection.
+     * This works instantly between tabs without relying on WebSocket.
+     */
+    initializeLocalChannel() {
+        const channelName = `collaboration-${this.container.reference}-${this.container.site}`;
+        this.localChannel = new BroadcastChannel(channelName);
+
+        this.localChannel.onmessage = (event) => {
+            const { type, windowId } = event.data;
+
+            if (windowId === this.windowId) return;
+
+            switch (type) {
+                case 'window-joined':
+                    this.debug(`🖥️ Local window joined: ${windowId}`);
+                    this.localWindows.add(windowId);
+                    // Respond so the new window knows about us
+                    this.localChannel.postMessage({ type: 'window-present', windowId: this.windowId });
+                    break;
+
+                case 'window-present':
+                    this.debug(`🖥️ Local window present: ${windowId}`);
+                    this.localWindows.add(windowId);
+                    break;
+
+                case 'window-left':
+                    this.debug(`🖥️ Local window left: ${windowId}`);
+                    this.localWindows.delete(windowId);
+                    break;
+            }
+        };
+
+        // Announce ourselves to other local windows
+        this.localChannel.postMessage({ type: 'window-joined', windowId: this.windowId });
+        this.debug('🖥️ Local channel initialized');
     }
 
     initializeVisibilityHandler() {
@@ -177,8 +220,14 @@ export default class Workspace {
             document.removeEventListener('visibilitychange', this.visibilityHandler);
         }
 
-        // Announce that this window is leaving
+        // Announce that this window is leaving (via WebSocket)
         this.channel.whisper('window-left', { windowId: this.windowId });
+
+        // Announce that this window is leaving (via BroadcastChannel)
+        if (this.localChannel) {
+            this.localChannel.postMessage({ type: 'window-left', windowId: this.windowId });
+            this.localChannel.close();
+        }
 
         // Remove ourselves from active windows
         this.activeWindows.delete(this.windowId);
@@ -846,16 +895,16 @@ export default class Workspace {
             return false;
         }
 
-        // Check if this is the only window (not just the only user)
-        // Also check users from presence channel as fallback
+        // Check multiple sources for other windows/users
         const users = Statamic.$store.state.collaboration[this.channelName]?.users || [];
         const multipleUsers = users.length > 1;
-        const multipleWindows = this.activeWindows.size > 1;
+        const multipleRemoteWindows = this.activeWindows.size > 1;
+        const multipleLocalWindows = this.localWindows.size > 0; // Other local windows in same browser
 
-        // Not alone if multiple users OR multiple windows
-        const alone = !multipleUsers && !multipleWindows;
+        // Not alone if multiple users OR multiple remote windows OR other local windows
+        const alone = !multipleUsers && !multipleRemoteWindows && !multipleLocalWindows;
 
-        this.debug(`isAlone check: users=${users.length}, activeWindows=${this.activeWindows.size}, alone=${alone}`);
+        this.debug(`isAlone check: users=${users.length}, remoteWindows=${this.activeWindows.size}, localWindows=${this.localWindows.size}, alone=${alone}`);
         return alone;
     }
 
