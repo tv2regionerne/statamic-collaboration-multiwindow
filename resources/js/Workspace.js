@@ -39,6 +39,10 @@ export default class Workspace {
         this.debouncedBroadcastMetaChangeFuncsByHandle = {};
         this.debouncedPersistValueFuncsByHandle = {};
         this.debouncedPersistMetaFuncsByHandle = {};
+
+        // Toast notification flags (to avoid duplicate toasts)
+        this.notSavedToastShown = false;
+        this.unsavedToastShown = false;
     }
 
     generateWindowId() {
@@ -210,7 +214,7 @@ export default class Workspace {
 
             // Only show toast and play sound for OTHER users (not our own other windows)
             if (user.id !== this.user.id) {
-                Statamic.$toast.success(`${user.name} has joined.`);
+                Statamic.$toast.info(`${user.name} has joined.`, { duration: 2000 });
                 if (Statamic.$config.get('collaboration.sound_effects')) {
                     this.playAudio('buddy-in');
                 }
@@ -223,7 +227,7 @@ export default class Workspace {
 
             // Only show toast and play sound for OTHER users (not our own other windows)
             if (user.id !== this.user.id) {
-                Statamic.$toast.success(`${user.name} has left.`);
+                Statamic.$toast.info(`${user.name} has left.`, { duration: 2000 });
                 if (Statamic.$config.get('collaboration.sound_effects')) {
                     this.playAudio('buddy-out');
                 }
@@ -263,6 +267,9 @@ export default class Workspace {
                 this.focus(user, handle);
             } else {
                 this.focusAndLock(user, handle);
+                // Show toast that another user is editing this field
+                const fieldName = this.formatFieldName(handle);
+                Statamic.$toast.info(`${fieldName} is being edited by ${user.name}.`, { duration: 2000 });
             }
         });
 
@@ -277,6 +284,11 @@ export default class Workspace {
                 this.blur(user);
             } else {
                 this.blurAndUnlock(user, handle);
+                // Show toast that another user finished editing
+                if (handle) {
+                    const fieldName = this.formatFieldName(handle);
+                    Statamic.$toast.success(`${fieldName} is no longer being edited by ${user.name}.`, { duration: 2000 });
+                }
             }
         });
 
@@ -299,6 +311,10 @@ export default class Workspace {
             const currentValues = Statamic.$store.state.publish[this.container.name].values;
             Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
             Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
+
+            // Reset toast flags
+            this.unsavedToastShown = false;
+            this.notSavedToastShown = false;
 
             Statamic.$toast.success(`Saved by ${user.name}.`);
         });
@@ -391,6 +407,10 @@ export default class Workspace {
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
                 Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
                 Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
+
+                // Reset toast flags
+                this.unsavedToastShown = false;
+                this.notSavedToastShown = false;
 
                 // Clear cached state from server
                 this.clearCachedState();
@@ -585,8 +605,10 @@ export default class Workspace {
         const state = Statamic.$store.state.collaboration[this.channelName];
         const currentStatus = state.saveStatus;
 
-        // If it's a new entry that was never saved, keep it as 'notSaved'
-        if (currentStatus === 'notSaved') {
+        // If it's a new entry that was never saved, show toast once
+        if (currentStatus === 'notSaved' && !this.notSavedToastShown) {
+            this.notSavedToastShown = true;
+            Statamic.$toast.info('New entry — changes stored temporarily for 12 hours.');
             return;
         }
 
@@ -603,9 +625,16 @@ export default class Workspace {
         if (hasChanges && currentStatus !== 'changesNotSaved') {
             Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'changesNotSaved');
             this.debug('📝 Save status changed to: changesNotSaved');
+            // Show toast for unsaved changes (only once per "dirty" state)
+            if (!this.unsavedToastShown) {
+                this.unsavedToastShown = true;
+                Statamic.$toast.info('Unsaved changes — stored temporarily for 12 hours.');
+            }
         } else if (!hasChanges && currentStatus !== 'saved') {
             Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
             this.debug('📝 Save status changed to: saved');
+            // Reset toast flag so it can show again next time
+            this.unsavedToastShown = false;
         }
     }
 
@@ -684,6 +713,15 @@ export default class Workspace {
         return _.mapObject(payload, (value, key) => {
             return {...this.lastMetaValues[key], ...value};
         });
+    }
+
+    formatFieldName(handle) {
+        if (!handle) return 'Field';
+        // Convert handle like "my_field_name" or "myFieldName" to "My field name"
+        return handle
+            .replace(/_/g, ' ')
+            .replace(/([a-z])([A-Z])/g, '$1 $2')
+            .replace(/^./, str => str.toUpperCase());
     }
 
     async applyBroadcastedValueChange(payload) {
