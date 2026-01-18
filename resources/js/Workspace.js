@@ -295,6 +295,11 @@ export default class Workspace {
             // Ignore if this is our own save action
             if (windowId === this.windowId) return;
 
+            // Update save status and original values since another window saved
+            const currentValues = Statamic.$store.state.publish[this.container.name].values;
+            Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
+            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
+
             Statamic.$toast.success(`Saved by ${user.name}.`);
         });
 
@@ -325,11 +330,20 @@ export default class Workspace {
     }
 
     initializeStore() {
+        // Detect if this is a new entry (not yet saved)
+        // New entries typically have 'create' in the reference or no valid ID
+        const isNewEntry = this.container.reference.includes('create') ||
+                          !this.container.reference.match(/[a-f0-9-]{36}$/i);
+
         Statamic.$store.registerModule(['collaboration', this.channelName], {
             namespaced: true,
             state: {
                 users: [],
                 focus: {},
+                // Save status: 'notSaved' (new), 'saved' (no changes), 'changesNotSaved' (has changes)
+                saveStatus: isNewEntry ? 'notSaved' : 'saved',
+                // Store original values to detect changes
+                originalValues: null,
             },
             mutations: {
                 setUsers(state, users) {
@@ -346,6 +360,12 @@ export default class Workspace {
                 },
                 blur(state, user) {
                     Vue.delete(state.focus, user.id);
+                },
+                setSaveStatus(state, status) {
+                    state.saveStatus = status;
+                },
+                setOriginalValues(state, values) {
+                    state.originalValues = values;
                 }
             }
         });
@@ -367,6 +387,14 @@ export default class Workspace {
     initializeHooks() {
         Statamic.$hooks.on('entry.saved', (resolve, reject, { reference }) => {
             if (reference === this.container.reference) {
+                // Update save status to 'saved' and store new original values
+                const currentValues = Statamic.$store.state.publish[this.container.name].values;
+                Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
+                Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
+
+                // Clear cached state from server
+                this.clearCachedState();
+
                 // Force whisper to notify all windows (including own other windows)
                 this.whisper('saved', { user: this.user, windowId: this.windowId }, { force: true });
             }
@@ -460,6 +488,9 @@ export default class Workspace {
 
         this.rememberValueChange(payload.handle, payload.value);
 
+        // Update save status based on whether values differ from original
+        this.updateSaveStatus();
+
         // Reset inactivity timer on any change
         this.resetActivityTimer();
 
@@ -548,6 +579,34 @@ export default class Workspace {
     metaHasChanged(handle, newValue) {
         const lastValue = this.lastMetaValues[handle] || null;
         return JSON.stringify(lastValue) !== JSON.stringify(newValue);
+    }
+
+    updateSaveStatus() {
+        const state = Statamic.$store.state.collaboration[this.channelName];
+        const currentStatus = state.saveStatus;
+
+        // If it's a new entry that was never saved, keep it as 'notSaved'
+        if (currentStatus === 'notSaved') {
+            return;
+        }
+
+        // Compare current values with original values
+        const currentValues = Statamic.$store.state.publish[this.container.name].values;
+        const originalValues = state.originalValues;
+
+        if (!originalValues) {
+            return;
+        }
+
+        const hasChanges = JSON.stringify(currentValues) !== JSON.stringify(originalValues);
+
+        if (hasChanges && currentStatus !== 'changesNotSaved') {
+            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'changesNotSaved');
+            this.debug('📝 Save status changed to: changesNotSaved');
+        } else if (!hasChanges && currentStatus !== 'saved') {
+            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
+            this.debug('📝 Save status changed to: saved');
+        }
     }
 
     async broadcastValueChange(payload) {
@@ -748,6 +807,12 @@ export default class Workspace {
     initializeValuesAndMeta() {
         this.lastValues = clone(Statamic.$store.state.publish[this.container.name].values);
         this.lastMetaValues = clone(Statamic.$store.state.publish[this.container.name].meta);
+
+        // Store original values to detect changes later
+        Statamic.$store.commit(
+            `collaboration/${this.channelName}/setOriginalValues`,
+            clone(this.lastValues)
+        );
     }
 
     cancelPendingBroadcasts() {
