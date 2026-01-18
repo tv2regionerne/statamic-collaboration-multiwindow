@@ -53,12 +53,27 @@ export default class Workspace {
     }
 
     initializeVisibilityHandler() {
+        // Track the previous visibility state to avoid spurious events
+        this.wasHidden = document.visibilityState === 'hidden';
+
         this.visibilityHandler = async () => {
-            if (document.visibilityState === 'visible') {
-                this.debug('👁️ Window became visible, syncing state...');
+            const isNowVisible = document.visibilityState === 'visible';
+            const isNowHidden = document.visibilityState === 'hidden';
+
+            if (isNowHidden) {
+                this.wasHidden = true;
+                this.debug('👁️ Window became hidden');
+                return;
+            }
+
+            if (isNowVisible && this.wasHidden) {
+                this.wasHidden = false;
+                this.debug('👁️ Window became visible after being hidden, syncing state...');
                 await this.loadCachedState('visibilityHandler');
                 // Re-announce ourselves to get fresh state from other windows
                 this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
+            } else if (isNowVisible) {
+                this.debug('👁️ Visibility event fired but window was not hidden, skipping sync');
             }
         };
 
