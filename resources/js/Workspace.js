@@ -661,6 +661,7 @@ export default class Workspace {
     }
 
     debug(message, args) {
+        if (!Statamic.$config.get('collaboration.debug')) return;
         console.log(`[Collaboration ${this.windowId?.slice(-6) || 'init'}]`, message, {...args});
     }
 
@@ -940,9 +941,9 @@ export default class Workspace {
 
         Statamic.$components.append('CollaborationBlockingNotification', {
             props: {
-                title: 'Inaktivitet',
-                message: 'Der har ikke været aktivitet i 12 timer. Luk venligst dette indhold for at undgå konflikter.',
-                confirmText: 'Luk indhold'
+                title: 'Inactivity Warning',
+                message: 'There has been no activity for 12 hours. Please close this content to avoid conflicts.',
+                confirmText: 'Close'
             }
         }).on('confirm', () => {
             // Navigate away or close

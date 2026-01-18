@@ -14,4 +14,16 @@ return [
 
     'sound_effects' => true,
 
+    /*
+    |--------------------------------------------------------------------------
+    | Debug Mode
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, detailed debug messages will be logged to the browser
+    | console. Useful for troubleshooting collaboration issues.
+    |
+    */
+
+    'debug' => env('COLLABORATION_DEBUG', false),
+
 ];
