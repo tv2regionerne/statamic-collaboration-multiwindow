@@ -28,6 +28,9 @@ export default class Workspace {
         this.inactivityTimer = null;
         this.inactivityWarningShown = false;
 
+        // Prevent concurrent loadCachedState calls
+        this.loadingCachedState = false;
+
         this.debouncedBroadcastValueChangeFuncsByHandle = {};
         this.debouncedBroadcastMetaChangeFuncsByHandle = {};
         this.debouncedPersistValueFuncsByHandle = {};
@@ -741,7 +744,14 @@ export default class Workspace {
     }
 
     async loadCachedState(source = 'unknown') {
+        // Prevent concurrent loadCachedState calls
+        if (this.loadingCachedState) {
+            this.debug(`🔄 loadCachedState already in progress, skipping call from: ${source}`);
+            return;
+        }
+        this.loadingCachedState = true;
         this.debug(`🔄 loadCachedState called from: ${source}`);
+
         try {
             const response = await fetch(this.stateApiUrl, {
                 headers: {
@@ -792,6 +802,8 @@ export default class Workspace {
             this.initialStateUpdated = true;
         } catch (error) {
             this.debug('Failed to load cached state', { error });
+        } finally {
+            this.loadingCachedState = false;
         }
     }
 
