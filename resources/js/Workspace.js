@@ -743,6 +743,21 @@ export default class Workspace {
         this.lastMetaValues = clone(Statamic.$store.state.publish[this.container.name].meta);
     }
 
+    cancelPendingBroadcasts() {
+        // Cancel all pending debounced broadcast functions
+        Object.values(this.debouncedBroadcastValueChangeFuncsByHandle).forEach(func => {
+            if (func && typeof func.cancel === 'function') {
+                func.cancel();
+            }
+        });
+        Object.values(this.debouncedBroadcastMetaChangeFuncsByHandle).forEach(func => {
+            if (func && typeof func.cancel === 'function') {
+                func.cancel();
+            }
+        });
+        this.debug('🚫 Cancelled pending debounced broadcasts');
+    }
+
     async loadCachedState(source = 'unknown') {
         // Prevent concurrent loadCachedState calls
         if (this.loadingCachedState) {
@@ -751,6 +766,13 @@ export default class Workspace {
         }
         this.loadingCachedState = true;
         this.debug(`🔄 loadCachedState called from: ${source}`);
+
+        // Cancel any pending debounced broadcasts to prevent them from firing during fetch
+        this.cancelPendingBroadcasts();
+
+        // Set applyingBroadcast BEFORE fetch to prevent any broadcasts during the entire operation
+        this.debug('🔒 Setting applyingBroadcast = true (before fetch)');
+        this.applyingBroadcast = true;
 
         try {
             const response = await fetch(this.stateApiUrl, {
@@ -772,37 +794,31 @@ export default class Workspace {
 
             this.debug('✅ Applying cached state from server', data);
 
-            // Mark that we're applying external data to prevent re-broadcasting
-            this.debug('🔒 Setting applyingBroadcast = true');
-            this.applyingBroadcast = true;
-            try {
-                // Apply cached values - merge with current values
-                if (data.values && Object.keys(data.values).length > 0) {
-                    const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                    const mergedValues = { ...currentValues, ...data.values };
-                    this.debug('📝 Dispatching setValues...');
-                    await Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
-                    this.debug('📝 setValues dispatch completed');
-                }
+            // Apply cached values - merge with current values
+            if (data.values && Object.keys(data.values).length > 0) {
+                const currentValues = Statamic.$store.state.publish[this.container.name].values;
+                const mergedValues = { ...currentValues, ...data.values };
+                this.debug('📝 Dispatching setValues...');
+                await Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
+                this.debug('📝 setValues dispatch completed');
+            }
 
-                // Apply cached meta - merge with current meta
-                if (data.meta && Object.keys(data.meta).length > 0) {
-                    const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
-                    const mergedMeta = { ...currentMeta };
-                    Object.keys(data.meta).forEach(handle => {
-                        mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
-                    });
-                    await Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
-                }
-            } finally {
-                this.debug('🔓 Setting applyingBroadcast = false');
-                this.applyingBroadcast = false;
+            // Apply cached meta - merge with current meta
+            if (data.meta && Object.keys(data.meta).length > 0) {
+                const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
+                const mergedMeta = { ...currentMeta };
+                Object.keys(data.meta).forEach(handle => {
+                    mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
+                });
+                await Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
             }
 
             this.initialStateUpdated = true;
         } catch (error) {
             this.debug('Failed to load cached state', { error });
         } finally {
+            this.debug('🔓 Setting applyingBroadcast = false');
+            this.applyingBroadcast = false;
             this.loadingCachedState = false;
         }
     }
