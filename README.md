@@ -6,9 +6,13 @@
 
 ## Features
 
-- Presence indicators when multiple people have the same entry opened.
-- Fields get locked when someone else focuses them.
-- Updates to field values are reflected to everyone.
+- **Presence indicators** when multiple people have the same entry opened.
+- **Field locking** when someone else is editing a field, with toast notifications.
+- **Real-time sync** of field values across all users and windows.
+- **Multi-window support** — same user can edit in multiple browser tabs without conflicts.
+- **State persistence** — unsaved changes are temporarily stored for up to 12 hours.
+- **Save status notifications** — toast messages inform users about unsaved changes.
+- **Inactivity timeout** — warns users after 12 hours of inactivity.
 
 ## Installation
 
