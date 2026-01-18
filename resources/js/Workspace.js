@@ -43,6 +43,10 @@ export default class Workspace {
         // Toast notification flags (to avoid duplicate toasts)
         this.notSavedToastShown = false;
         this.unsavedToastShown = false;
+
+        // Grace period after save (to avoid false "unsaved changes" from post-save mutations)
+        this.lastSaveTime = 0;
+        this.saveGracePeriodMs = 2000;
     }
 
     generateWindowId() {
@@ -60,6 +64,7 @@ export default class Workspace {
         this.initializeHooks();
         this.initializeStatusBar();
         this.initializeVisibilityHandler();
+        this.initializeTypingIndicatorStyles();
         this.started = true;
     }
 
@@ -91,6 +96,43 @@ export default class Workspace {
         document.addEventListener('visibilitychange', this.visibilityHandler);
     }
 
+    initializeTypingIndicatorStyles() {
+        // Create a style element for typing indicator animations
+        this.typingStyleElement = document.createElement('style');
+        this.typingStyleElement.id = `collaboration-typing-${this.channelName.replace(/\./g, '-')}`;
+        document.head.appendChild(this.typingStyleElement);
+
+        // Base styles for typing animation
+        this.typingStyleElement.textContent = `
+            @keyframes collaboration-typing-pulse {
+                0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+                50% { box-shadow: 0 0 0 4px rgba(34, 197, 94, 0); }
+            }
+            .collaboration-typing-indicator {
+                animation: collaboration-typing-pulse 1.5s infinite;
+            }
+        `;
+    }
+
+    updateTypingIndicators() {
+        const typing = Statamic.$store.state.collaboration[this.channelName]?.typing || {};
+        const handles = Object.values(typing).map(t => t.handle).filter(Boolean);
+
+        // Find and update field elements
+        document.querySelectorAll('.publish-field').forEach(field => {
+            const handle = field.dataset.handle || field.querySelector('[data-handle]')?.dataset.handle;
+            const avatar = field.querySelector('.read-only-field .avatar, .publish-field-lock .avatar');
+
+            if (avatar) {
+                if (handles.includes(handle)) {
+                    avatar.classList.add('collaboration-typing-indicator');
+                } else {
+                    avatar.classList.remove('collaboration-typing-indicator');
+                }
+            }
+        });
+    }
+
     initializeStateApi() {
         const reference = this.container.reference.replaceAll('::', '.');
         const site = this.container.site.replaceAll('.', '_');
@@ -105,6 +147,11 @@ export default class Workspace {
         // Remove visibility handler
         if (this.visibilityHandler) {
             document.removeEventListener('visibilitychange', this.visibilityHandler);
+        }
+
+        // Remove typing indicator styles
+        if (this.typingStyleElement) {
+            this.typingStyleElement.remove();
         }
 
         // Announce that this window is leaving
@@ -123,6 +170,9 @@ export default class Workspace {
         const reference = this.container.reference.replaceAll('::', '.');
         this.channelName = `${reference}.${this.container.site.replaceAll('.', '_')}`;
         this.channel = this.echo.join(this.channelName);
+
+        // Monitor connection status
+        this.initializeConnectionMonitoring();
 
         this.channel.here(async users => {
             this.subscribeToVuexMutations();
@@ -307,6 +357,9 @@ export default class Workspace {
             // Ignore if this is our own save action
             if (windowId === this.windowId) return;
 
+            // Mark save time to prevent false "unsaved changes" from post-save mutations
+            this.lastSaveTime = Date.now();
+
             // Update save status and original values since another window saved
             const currentValues = Statamic.$store.state.publish[this.container.name].values;
             Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
@@ -343,6 +396,77 @@ export default class Workspace {
             }).on('confirm', () => window.location.reload());
             this.destroy(); // Stop listening to anything else.
         });
+
+        // Listen for typing indicators
+        this.listenForWhisper('typing', ({ user, handle, windowId }) => {
+            if (windowId === this.windowId) return;
+            if (user.id === this.user.id) return;
+
+            Statamic.$store.commit(`collaboration/${this.channelName}/setTyping`, { user, handle });
+            this.updateTypingIndicators();
+
+            // Auto-clear typing indicator after 3 seconds of no updates
+            if (this.typingTimeouts && this.typingTimeouts[user.id]) {
+                clearTimeout(this.typingTimeouts[user.id]);
+            }
+            if (!this.typingTimeouts) this.typingTimeouts = {};
+            this.typingTimeouts[user.id] = setTimeout(() => {
+                Statamic.$store.commit(`collaboration/${this.channelName}/clearTyping`, user);
+                this.updateTypingIndicators();
+            }, 3000);
+        });
+
+        this.listenForWhisper('stopped-typing', ({ user, windowId }) => {
+            if (windowId === this.windowId) return;
+            if (user.id === this.user.id) return;
+
+            Statamic.$store.commit(`collaboration/${this.channelName}/clearTyping`, user);
+            this.updateTypingIndicators();
+        });
+    }
+
+    initializeConnectionMonitoring() {
+        // Get the underlying Pusher/Socket connection
+        const connector = this.echo.connector;
+
+        if (connector.pusher) {
+            // Pusher-based connection (Pusher, Reverb, Soketi, etc.)
+            const pusher = connector.pusher;
+
+            pusher.connection.bind('connecting', () => {
+                this.debug('🔄 Connection: connecting...');
+                Statamic.$store.commit(`collaboration/${this.channelName}/setConnectionStatus`, 'reconnecting');
+            });
+
+            pusher.connection.bind('connected', () => {
+                this.debug('✅ Connection: connected');
+                const wasDisconnected = Statamic.$store.state.collaboration[this.channelName]?.connectionStatus !== 'connected';
+                Statamic.$store.commit(`collaboration/${this.channelName}/setConnectionStatus`, 'connected');
+
+                if (wasDisconnected) {
+                    Statamic.$toast.success('Connection restored.', { duration: 2000 });
+                    // Reload state after reconnection
+                    this.loadCachedState('reconnected');
+                }
+            });
+
+            pusher.connection.bind('disconnected', () => {
+                this.debug('❌ Connection: disconnected');
+                Statamic.$store.commit(`collaboration/${this.channelName}/setConnectionStatus`, 'disconnected');
+                Statamic.$toast.error('Connection lost. Trying to reconnect...', { duration: false });
+            });
+
+            pusher.connection.bind('unavailable', () => {
+                this.debug('⚠️ Connection: unavailable');
+                Statamic.$store.commit(`collaboration/${this.channelName}/setConnectionStatus`, 'disconnected');
+            });
+
+            pusher.connection.bind('failed', () => {
+                this.debug('💀 Connection: failed');
+                Statamic.$store.commit(`collaboration/${this.channelName}/setConnectionStatus`, 'disconnected');
+                Statamic.$toast.error('Connection failed. Please refresh the page.', { duration: false });
+            });
+        }
     }
 
     initializeStore() {
@@ -360,6 +484,10 @@ export default class Workspace {
                 saveStatus: isNewEntry ? 'notSaved' : 'saved',
                 // Store original values to detect changes
                 originalValues: null,
+                // Connection status: 'connected', 'disconnected', 'reconnecting'
+                connectionStatus: 'connected',
+                // Track which users are actively typing (userId -> { handle, timestamp })
+                typing: {},
             },
             mutations: {
                 setUsers(state, users) {
@@ -382,6 +510,15 @@ export default class Workspace {
                 },
                 setOriginalValues(state, values) {
                     state.originalValues = values;
+                },
+                setConnectionStatus(state, status) {
+                    state.connectionStatus = status;
+                },
+                setTyping(state, { user, handle }) {
+                    Vue.set(state.typing, user.id, { handle, user, timestamp: Date.now() });
+                },
+                clearTyping(state, user) {
+                    Vue.delete(state.typing, user.id);
                 }
             }
         });
@@ -403,6 +540,9 @@ export default class Workspace {
     initializeHooks() {
         Statamic.$hooks.on('entry.saved', (resolve, reject, { reference }) => {
             if (reference === this.container.reference) {
+                // Mark save time to prevent false "unsaved changes" from post-save mutations
+                this.lastSaveTime = Date.now();
+
                 // Update save status to 'saved' and store new original values
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
                 Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
@@ -451,6 +591,7 @@ export default class Workspace {
             const user = this.user;
             this.blur(user, handle);
             this.whisper('blur', { user, handle, windowId: this.windowId });
+            this.whisper('stopped-typing', { user, windowId: this.windowId });
         });
     }
 
@@ -518,6 +659,13 @@ export default class Workspace {
         if (!this.applyingBroadcast) {
             // Track when we made this local change
             this.lastLocalChangeTime = Date.now();
+
+            // Check for conflict - is someone else typing on this field?
+            this.checkForConflict(payload.handle);
+
+            // Send typing indicator
+            this.whisper('typing', { user: this.user, handle: payload.handle, windowId: this.windowId });
+
             this.debug(`📤 Will broadcast change for ${payload.handle}`);
             this.debouncedBroadcastValueChangeFuncByHandle(payload.handle)(payload);
 
@@ -527,6 +675,36 @@ export default class Workspace {
             }
         } else {
             this.debug(`🚫 Not broadcasting - applyingBroadcast is true`);
+        }
+    }
+
+    checkForConflict(handle) {
+        const typing = Statamic.$store.state.collaboration[this.channelName]?.typing || {};
+
+        // Find if someone else is typing on this field
+        for (const userId in typing) {
+            const typingInfo = typing[userId];
+            if (typingInfo.handle === handle && userId !== this.user.id) {
+                // Check if the typing indicator is recent (within last 3 seconds)
+                const isRecent = Date.now() - typingInfo.timestamp < 3000;
+                if (isRecent && !this.conflictWarningShown?.[handle]) {
+                    // Show conflict warning
+                    const fieldName = this.formatFieldName(handle);
+                    Statamic.$toast.error(
+                        `${typingInfo.user.name} is also editing ${fieldName}. Your changes may overwrite theirs.`,
+                        { duration: 4000 }
+                    );
+                    // Track that we've shown this warning to avoid spam
+                    if (!this.conflictWarningShown) this.conflictWarningShown = {};
+                    this.conflictWarningShown[handle] = true;
+                    // Reset warning flag after 10 seconds
+                    setTimeout(() => {
+                        if (this.conflictWarningShown) {
+                            delete this.conflictWarningShown[handle];
+                        }
+                    }, 10000);
+                }
+            }
         }
     }
 
@@ -602,6 +780,13 @@ export default class Workspace {
     }
 
     updateSaveStatus() {
+        // Skip if we just saved (grace period to avoid false positives from post-save mutations)
+        const timeSinceSave = Date.now() - this.lastSaveTime;
+        if (timeSinceSave < this.saveGracePeriodMs) {
+            this.debug(`⏳ Skipping updateSaveStatus - within grace period (${timeSinceSave}ms since save)`);
+            return;
+        }
+
         const state = Statamic.$store.state.collaboration[this.channelName];
         const currentStatus = state.saveStatus;
 
