@@ -421,7 +421,15 @@ export default class Workspace {
     // It could have been triggered by the current user editing something,
     // or by the workspace applying a change dispatched by another user editing something.
     vuexFieldValueHasBeenSet(payload) {
-        this.debug('Vuex field value has been set', { handle: payload.handle, user: payload.user, applyingBroadcast: this.applyingBroadcast });
+        const valuePreview = typeof payload.value === 'string'
+            ? payload.value.slice(-50)
+            : JSON.stringify(payload.value).slice(-50);
+        this.debug('Vuex field value has been set', {
+            handle: payload.handle,
+            user: payload.user,
+            applyingBroadcast: this.applyingBroadcast,
+            valueEnd: valuePreview
+        });
         if (!this.valueHasChanged(payload.handle, payload.value)) {
             // No change? Don't bother doing anything.
             this.debug(`Value for ${payload.handle} has not changed.`);
@@ -522,7 +530,7 @@ export default class Workspace {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
         if (this.applyingBroadcast) {
             this.debug(`🚫 Skipping broadcast - applyingBroadcast is true`);
-            return;
+            return { largePayload: false };
         }
 
         // Only my own change events should be broadcasted
@@ -535,10 +543,12 @@ export default class Workspace {
                 // Wait for persist to complete before notifying others to fetch
                 await this.sendStateUpdate(payload.handle, payload.value, 'value');
                 this.channel.whisper('fetch-field', { handle: payload.handle, type: 'value', windowId: this.windowId });
+                return { largePayload: true }; // Signal that we already persisted
             } else {
                 this.whisper('updated', fullPayload);
             }
         }
+        return { largePayload: false };
     }
 
     async broadcastMetaChange(payload) {
