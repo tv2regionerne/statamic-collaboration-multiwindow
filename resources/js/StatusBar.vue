@@ -1,10 +1,9 @@
 <template>
-
-    <div class="collaboration-status-bar" :class="{ '-mt-2 mb-2': connecting || users.length > 1 }">
-        <loading-graphic v-if="connecting" :inline="true" :size="16" text="Attempting websocket connection..." />
-        <div v-if="users.length > 1" class="flex items-center">
+    <div class="collaboration-status-bar" :class="statusBarClass">
+        <loading-graphic v-if="isConnecting" :inline="true" :size="16" text="Attempting websocket connection..." />
+        <div v-if="hasMultipleUsers" class="flex items-center">
             <div
-                v-for="user in users"
+                v-for="user in userList"
                 :key="user.id"
             >
                 <dropdown-list>
@@ -19,7 +18,6 @@
             </div>
         </div>
     </div>
-
 </template>
 
 <script>
@@ -51,12 +49,20 @@ export default {
             }
             return this.$store.state.collaboration[this.channelName] || null;
         },
-        users() {
+        userList() {
             if (!this.collaborationState) return [];
             return this.collaborationState.users || [];
         },
-        connecting() {
-            return this.users.length === 0;
+        isConnecting() {
+            return this.userList.length === 0;
+        },
+        hasMultipleUsers() {
+            return this.userList.length > 1;
+        },
+        statusBarClass() {
+            return {
+                '-mt-2 mb-2': this.isConnecting || this.hasMultipleUsers
+            };
         }
     }
 }
