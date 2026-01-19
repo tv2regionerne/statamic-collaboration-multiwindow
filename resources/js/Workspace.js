@@ -40,6 +40,10 @@ export default class Workspace {
         this.debouncedPersistValueFuncsByHandle = {};
         this.debouncedPersistMetaFuncsByHandle = {};
 
+        // Toast notification flags (to avoid duplicate toasts)
+        this.notSavedToastShown = false;
+        this.unsavedToastShown = false;
+
         // Warm-up period: always broadcast for first few seconds after joining
         // This ensures sync works even before activeWindows is fully populated
         this.warmUpPeriod = true;
@@ -70,7 +74,6 @@ export default class Workspace {
         this.initializeValuesAndMeta();
         this.initializeHooks();
         this.initializeStatusBar();
-        this.initializeTemporaryChangesNotification();
         this.initializeVisibilityHandler();
         this.started = true;
     }
@@ -413,6 +416,10 @@ export default class Workspace {
             Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
             Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
 
+            // Reset toast flags
+            this.unsavedToastShown = false;
+            this.notSavedToastShown = false;
+
             Statamic.$toast.success(`Saved by ${user.name}.`);
         });
 
@@ -497,14 +504,6 @@ export default class Workspace {
         });
     }
 
-    initializeTemporaryChangesNotification() {
-        this.container.pushComponent('CollaborationTemporaryChangesNotification', {
-            props: {
-                channelName: this.channelName,
-            }
-        });
-    }
-
     initializeHooks() {
         Statamic.$hooks.on('entry.saved', (resolve, reject, { reference }) => {
             if (reference === this.container.reference) {
@@ -512,6 +511,10 @@ export default class Workspace {
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
                 Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
                 Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
+
+                // Reset toast flags
+                this.unsavedToastShown = false;
+                this.notSavedToastShown = false;
 
                 // Clear cached state from server
                 this.clearCachedState();
@@ -695,8 +698,10 @@ export default class Workspace {
         const state = Statamic.$store.state.collaboration[this.channelName];
         const currentStatus = state.saveStatus;
 
-        // New entries stay at 'notSaved' status
-        if (currentStatus === 'notSaved') {
+        // If it's a new entry that was never saved, show toast once
+        if (currentStatus === 'notSaved' && !this.notSavedToastShown) {
+            this.notSavedToastShown = true;
+            Statamic.$toast.info('New entry — changes stored temporarily for 12 hours.');
             return;
         }
 
@@ -713,9 +718,16 @@ export default class Workspace {
         if (hasChanges && currentStatus !== 'changesNotSaved') {
             Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'changesNotSaved');
             this.debug('📝 Save status changed to: changesNotSaved');
+            // Show toast for unsaved changes (only once per "dirty" state)
+            if (!this.unsavedToastShown) {
+                this.unsavedToastShown = true;
+                Statamic.$toast.info('Unsaved changes — stored temporarily for 12 hours.');
+            }
         } else if (!hasChanges && currentStatus !== 'saved') {
             Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
             this.debug('📝 Save status changed to: saved');
+            // Reset toast flag so it can show again next time
+            this.unsavedToastShown = false;
         }
     }
 
