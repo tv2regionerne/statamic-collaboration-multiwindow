@@ -601,26 +601,27 @@ export default class Workspace {
         this.applyingRemoteChange = true;
 
         try {
+            // Apply values using individual field commits for proper reactivity
             if (values && Object.keys(values).length > 0) {
-                const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                const mergedValues = { ...currentValues };
-
                 for (const handle of Object.keys(values)) {
                     // Skip if this field is currently being edited by us
                     if (this.currentFocus === handle) {
                         this.debug(`Skipping "${handle}" - currently editing`);
                         continue;
                     }
-                    mergedValues[handle] = values[handle];
+
+                    this.debug(`Applying value for "${handle}"`);
+                    Statamic.$store.commit(`publish/${this.container.name}/setFieldValue`, {
+                        handle,
+                        value: values[handle]
+                    });
                     this.lastValues[handle] = clone(values[handle]);
                 }
-
-                Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
             }
 
+            // Apply meta using individual field commits for proper reactivity
             if (meta && Object.keys(meta).length > 0) {
                 const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
-                const mergedMeta = { ...currentMeta };
 
                 for (const handle of Object.keys(meta)) {
                     // Skip if this field is currently being edited by us
@@ -628,11 +629,15 @@ export default class Workspace {
                         this.debug(`Skipping meta for "${handle}" - currently editing`);
                         continue;
                     }
-                    mergedMeta[handle] = { ...currentMeta[handle], ...meta[handle] };
-                    this.lastMeta[handle] = clone(mergedMeta[handle]);
-                }
 
-                Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
+                    const mergedFieldMeta = { ...currentMeta[handle], ...meta[handle] };
+                    this.debug(`Applying meta for "${handle}"`);
+                    Statamic.$store.commit(`publish/${this.container.name}/setFieldMeta`, {
+                        handle,
+                        value: mergedFieldMeta
+                    });
+                    this.lastMeta[handle] = clone(mergedFieldMeta);
+                }
             }
         } finally {
             // Delay resetting the flag to allow Vuex cascading mutations to complete
