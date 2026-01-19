@@ -281,25 +281,27 @@ export default class Workspace {
 
         // Listen for initial state from other windows (targeted to our windowId)
         // This always merges state since other windows may have fresher data than cached state
-        this.channel.listenForWhisper(`initialize-state-for-window-${this.windowId}`, async payload => {
+        this.channel.listenForWhisper(`initialize-state-for-window-${this.windowId}`, payload => {
             this.debug('✅ Applying/merging state from another window', payload);
 
             // Mark that we're applying external data to prevent re-broadcasting
             this.applyingBroadcast = true;
             try {
                 // Merge values with current state
+                // Use commit instead of dispatch to avoid triggering autosave
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
                 const mergedValues = { ...currentValues, ...payload.values };
-                await Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
+                Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
 
                 // Merge meta with current state
+                // Use commit instead of dispatch to avoid triggering autosave
                 const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
                 const restoredMeta = this.restoreEntireMetaPayload(payload.meta);
                 const mergedMeta = { ...currentMeta };
                 Object.keys(restoredMeta).forEach(handle => {
                     mergedMeta[handle] = { ...currentMeta[handle], ...restoredMeta[handle] };
                 });
-                await Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
+                Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
             } finally {
                 this.applyingBroadcast = false;
             }
@@ -854,7 +856,8 @@ export default class Workspace {
         // Mark that we're applying a broadcast to prevent re-broadcasting
         this.applyingBroadcast = true;
         try {
-            await Statamic.$store.dispatch(`publish/${this.container.name}/setFieldValue`, payload);
+            // Use commit instead of dispatch to avoid triggering autosave side effects
+            Statamic.$store.commit(`publish/${this.container.name}/setFieldValue`, payload);
         } finally {
             this.applyingBroadcast = false;
         }
@@ -885,7 +888,8 @@ export default class Workspace {
         // Mark that we're applying a broadcast to prevent re-broadcasting
         this.applyingBroadcast = true;
         try {
-            await Statamic.$store.dispatch(`publish/${this.container.name}/setFieldMeta`, payload);
+            // Use commit instead of dispatch to avoid triggering autosave side effects
+            Statamic.$store.commit(`publish/${this.container.name}/setFieldMeta`, payload);
         } finally {
             this.applyingBroadcast = false;
         }
@@ -1044,22 +1048,24 @@ export default class Workspace {
             this.debug('✅ Applying cached state from server', data);
 
             // Apply cached values - merge with current values
+            // Use commit instead of dispatch to avoid triggering autosave
             if (data.values && Object.keys(data.values).length > 0) {
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
                 const mergedValues = { ...currentValues, ...data.values };
-                this.debug('📝 Dispatching setValues...');
-                await Statamic.$store.dispatch(`publish/${this.container.name}/setValues`, mergedValues);
-                this.debug('📝 setValues dispatch completed');
+                this.debug('📝 Committing setValues...');
+                Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
+                this.debug('📝 setValues commit completed');
             }
 
             // Apply cached meta - merge with current meta
+            // Use commit instead of dispatch to avoid triggering autosave
             if (data.meta && Object.keys(data.meta).length > 0) {
                 const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
                 const mergedMeta = { ...currentMeta };
                 Object.keys(data.meta).forEach(handle => {
                     mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
                 });
-                await Statamic.$store.dispatch(`publish/${this.container.name}/setMeta`, mergedMeta);
+                Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
             }
 
             this.initialStateUpdated = true;
