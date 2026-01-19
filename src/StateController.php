@@ -53,6 +53,17 @@ class StateController extends Controller
 
         $key = $this->cacheKey($reference, $site);
 
+        // Handle full state update (all values and meta at once)
+        if ($request->boolean('full')) {
+            $state = [
+                'values' => $request->input('values', []),
+                'meta' => $request->input('meta', []),
+            ];
+            Cache::put($key, $state, $this->ttl);
+            return response()->json(['success' => true]);
+        }
+
+        // Handle single field update (legacy)
         $validated = $request->validate([
             'handle' => 'required|string',
             'value' => 'present',

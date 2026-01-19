@@ -38,9 +38,6 @@ export default class Workspace {
         // Track fields recently updated via broadcast (to avoid overwriting with stale server data)
         this.recentBroadcastUpdates = {}; // { handle: timestamp }
 
-        this.debouncedBroadcastValueChangeFuncsByHandle = {};
-        this.debouncedBroadcastMetaChangeFuncsByHandle = {};
-
         // Toast notification flags (to avoid duplicate toasts)
         this.notSavedToastShown = false;
         this.unsavedToastShown = false;
@@ -54,20 +51,19 @@ export default class Workspace {
         this.localChannel = null;
         this.localWindows = new Set();
 
+        // Sync interval: persist and fetch every 3 seconds while field is focused
+        this.syncInterval = 3000;
+        this.syncIntervalTimer = null;
+        this.currentFocusedField = null;
+        this.hasPendingChanges = false;
+
         // Field lock timing: 3 second delay before unlocking after blur
         this.fieldUnlockDelay = 3000;
         this.pendingFieldUnlocks = {}; // { handle: timeoutId }
 
-        // Field inactivity: auto-unlock after 10 seconds of no activity
-        this.fieldInactivityTimeout = 10000;
-        this.fieldInactivityTimers = {}; // { handle: timeoutId }
-        this.currentFocusedField = null;
-
-        // Update timing: only sync data when user is inactive for 3 seconds or presses space/char
-        this.pendingServerUpdates = {}; // { handle: { value, type, timestamp } }
-        this.updateInactivityDelay = 3000;
-        this.updateInactivityTimer = null;
-        this.lastKeyPressTime = 0;
+        // Field inactivity: auto-unlock after 60 seconds of no activity
+        this.fieldInactivityTimeout = 60000;
+        this.fieldInactivityTimer = null;
     }
 
     generateWindowId() {
@@ -217,20 +213,14 @@ export default class Workspace {
         // Clear inactivity timer
         this.clearActivityTimer();
 
-        // Clear field inactivity timers
-        Object.keys(this.fieldInactivityTimers).forEach(handle => {
-            this.clearFieldInactivityTimer(handle);
-        });
+        // Stop sync interval and field inactivity timer
+        this.stopSyncInterval();
+        this.clearFieldInactivityTimer();
 
         // Clear pending field unlocks
         Object.keys(this.pendingFieldUnlocks).forEach(handle => {
             this.cancelPendingUnlock(handle);
         });
-
-        // Clear update inactivity timer
-        if (this.updateInactivityTimer) {
-            clearTimeout(this.updateInactivityTimer);
-        }
 
         // Remove keypress handler
         if (this.keypressHandler) {
@@ -399,24 +389,18 @@ export default class Workspace {
             this.blurAndUnlock(user);
         });
 
-        // Listen for data change notifications - always fetch from server
-        this.channel.listenForWhisper('data-changed', ({ handle, type, windowId }) => {
-            this.debug(`📥 Received data-changed from ${windowId?.slice(-6)}, my windowId: ${this.windowId?.slice(-6)}`);
-            if (windowId === this.windowId) {
-                this.debug(`📥 Skipping own data-changed`);
-                return;
-            }
-
-            // Queue the update - will be applied when user is inactive or presses space/char
-            this.queuePendingUpdate(handle, type, windowId);
-        });
-
-        // Listen for sync-now notifications - another user finished editing and wants us to sync
+        // Listen for sync-now notifications - fetch latest state from server
         this.channel.listenForWhisper('sync-now', ({ windowId }) => {
             if (windowId === this.windowId) return;
 
-            this.debug(`📥 Received sync-now from ${windowId?.slice(-6)}, triggering pending updates`);
-            this.triggerPendingUpdates();
+            // Don't sync if we're currently editing (have a focused field)
+            if (this.currentFocusedField) {
+                this.debug(`📥 Received sync-now but skipping - currently editing`);
+                return;
+            }
+
+            this.debug(`📥 Received sync-now from ${windowId?.slice(-6)}, fetching from server`);
+            this.loadCachedState('sync-now');
         });
 
         this.listenForWhisper('focus', ({ user, handle, windowId }) => {
@@ -613,15 +597,12 @@ export default class Workspace {
             const user = this.user;
 
             // Cancel any pending unlock for this field
-            if (this.pendingFieldUnlocks[handle]) {
-                clearTimeout(this.pendingFieldUnlocks[handle]);
-                delete this.pendingFieldUnlocks[handle];
-                this.debug(`🔓 Cancelled pending unlock for "${handle}"`);
-            }
+            this.cancelPendingUnlock(handle);
 
-            // Track currently focused field and start inactivity timer
+            // Track currently focused field and start sync interval
             this.currentFocusedField = handle;
-            this.resetFieldInactivityTimer(handle);
+            this.startSyncInterval();
+            this.resetFieldInactivityTimer();
 
             this.focus(user, handle);
             this.whisper('focus', { user, handle, windowId: this.windowId });
@@ -630,67 +611,121 @@ export default class Workspace {
         this.container.$on('blur', handle => {
             const user = this.user;
 
-            // Clear inactivity timer
-            this.clearFieldInactivityTimer(handle);
+            // Stop sync interval and inactivity timer
+            this.stopSyncInterval();
+            this.clearFieldInactivityTimer();
             this.currentFocusedField = null;
 
-            // Trigger any pending updates when leaving a field
-            this.triggerPendingUpdates();
+            // Persist any pending changes immediately
+            if (this.hasPendingChanges) {
+                this.persistAllChanges();
+            }
 
             // Tell other clients to sync now (fetch latest from server)
             this.channel.whisper('sync-now', { windowId: this.windowId });
 
-            // Delay unlock by 3 seconds - still inform others immediately via focus state
+            // Inform about blur but schedule delayed unlock
             this.blur(user);
             this.whisper('blur', { user, handle, windowId: this.windowId });
+
+            // Field stays locked for 3 more seconds after blur
+            this.scheduleDelayedUnlock(handle);
         });
 
         // Listen for keypress to reset field inactivity timer
-        this.keypressHandler = (e) => {
+        this.keypressHandler = () => {
             if (this.currentFocusedField) {
-                this.resetFieldInactivityTimer(this.currentFocusedField);
-                this.lastKeyPressTime = Date.now();
-
-                // If space or other character, trigger pending updates
-                if (e.key === ' ' || e.key.length === 1) {
-                    this.triggerPendingUpdates();
-                }
+                this.resetFieldInactivityTimer();
             }
         };
         document.addEventListener('keydown', this.keypressHandler);
     }
 
-    resetFieldInactivityTimer(handle) {
-        this.clearFieldInactivityTimer(handle);
+    startSyncInterval() {
+        this.stopSyncInterval();
 
-        this.fieldInactivityTimers[handle] = setTimeout(() => {
-            this.debug(`⏰ Field "${handle}" inactive for 10 seconds, auto-unlocking`);
-            this.autoUnlockField(handle);
+        this.debug(`🔄 Starting sync interval (every ${this.syncInterval}ms)`);
+
+        this.syncIntervalTimer = setInterval(() => {
+            // Persist changes if we have any
+            if (this.hasPendingChanges) {
+                this.debug(`🔄 Sync interval: persisting changes`);
+                this.persistAllChanges();
+            }
+        }, this.syncInterval);
+    }
+
+    stopSyncInterval() {
+        if (this.syncIntervalTimer) {
+            clearInterval(this.syncIntervalTimer);
+            this.syncIntervalTimer = null;
+            this.debug(`🔄 Stopped sync interval`);
+        }
+    }
+
+    resetFieldInactivityTimer() {
+        this.clearFieldInactivityTimer();
+
+        this.fieldInactivityTimer = setTimeout(() => {
+            if (this.currentFocusedField) {
+                this.debug(`⏰ Field "${this.currentFocusedField}" inactive for 60 seconds, auto-unlocking`);
+                this.autoUnlockField(this.currentFocusedField);
+            }
         }, this.fieldInactivityTimeout);
     }
 
-    clearFieldInactivityTimer(handle) {
-        if (this.fieldInactivityTimers[handle]) {
-            clearTimeout(this.fieldInactivityTimers[handle]);
-            delete this.fieldInactivityTimers[handle];
+    clearFieldInactivityTimer() {
+        if (this.fieldInactivityTimer) {
+            clearTimeout(this.fieldInactivityTimer);
+            this.fieldInactivityTimer = null;
         }
     }
 
     autoUnlockField(handle) {
-        // Force blur the active element if it matches
-        if (document.activeElement && this.currentFocusedField === handle) {
+        // Force blur the active element
+        if (document.activeElement) {
             document.activeElement.blur();
         }
 
+        // Stop sync interval and inactivity timer
+        this.stopSyncInterval();
+        this.clearFieldInactivityTimer();
         this.currentFocusedField = null;
 
-        // Trigger any pending updates and tell others to sync
-        this.triggerPendingUpdates();
+        // Persist any pending changes
+        if (this.hasPendingChanges) {
+            this.persistAllChanges();
+        }
+
+        // Tell other clients to sync now
         this.channel.whisper('sync-now', { windowId: this.windowId });
 
+        // Inform about blur and schedule delayed unlock
         this.blur(this.user);
         this.whisper('blur', { user: this.user, handle, windowId: this.windowId });
+        this.scheduleDelayedUnlock(handle);
+
         Statamic.$toast.info(`Field auto-unlocked due to inactivity.`, { duration: 2000 });
+    }
+
+    async persistAllChanges() {
+        if (!this.hasPendingChanges) return;
+
+        this.hasPendingChanges = false;
+
+        // Persist current values and meta to server
+        const values = Statamic.$store.state.publish[this.container.name].values;
+        const meta = Statamic.$store.state.publish[this.container.name].meta;
+
+        try {
+            await this.sendFullStateUpdate(values, meta);
+            // Notify others to fetch
+            this.channel.whisper('sync-now', { windowId: this.windowId });
+            this.debug(`📦 Persisted all changes to server`);
+        } catch (error) {
+            this.debug(`Failed to persist changes`, { error });
+            this.hasPendingChanges = true; // Retry on next interval
+        }
     }
 
     scheduleDelayedUnlock(handle) {
@@ -751,18 +786,7 @@ export default class Workspace {
     // It could have been triggered by the current user editing something,
     // or by the workspace applying a change dispatched by another user editing something.
     vuexFieldValueHasBeenSet(payload) {
-        const valuePreview = typeof payload.value === 'string'
-            ? payload.value.slice(-50)
-            : JSON.stringify(payload.value).slice(-50);
-        this.debug('Vuex field value has been set', {
-            handle: payload.handle,
-            user: payload.user,
-            applyingBroadcast: this.applyingBroadcast,
-            valueEnd: valuePreview
-        });
         if (!this.hasChanged('value', payload.handle, payload.value)) {
-            // No change? Don't bother doing anything.
-            this.debug(`Value for ${payload.handle} has not changed.`);
             return;
         }
 
@@ -774,15 +798,11 @@ export default class Workspace {
         // Reset inactivity timer on any change
         this.resetActivityTimer();
 
-        // Only broadcast if this change originated from THIS window
+        // Mark that we have pending changes (will be persisted by sync interval)
         if (!this.applyingBroadcast) {
-            // Track when we made this local change
             this.lastLocalChangeTime = Date.now();
-            this.debug(`📤 Will broadcast change for ${payload.handle}`);
-            // Broadcast will also persist to server
-            this.debouncedBroadcastValueChangeFuncByHandle(payload.handle)(payload);
-        } else {
-            this.debug(`🚫 Not broadcasting - applyingBroadcast is true`);
+            this.hasPendingChanges = true;
+            this.debug(`📝 Value changed for ${payload.handle}, marked as pending`);
         }
     }
 
@@ -790,10 +810,7 @@ export default class Workspace {
     // It could have been triggered by the current user editing something,
     // or by the workspace applying a change dispatched by another user editing something.
     vuexFieldMetaHasBeenSet(payload) {
-        this.debug('Vuex field meta has been set', payload);
         if (!this.hasChanged('meta', payload.handle, payload.value)) {
-            // No change? Don't bother doing anything.
-            this.debug(`Meta for ${payload.handle} has not changed.`, { value: payload.value, lastValue: this.lastMetaValues[payload.handle] });
             return;
         }
 
@@ -802,38 +819,16 @@ export default class Workspace {
         // Reset inactivity timer on any change
         this.resetActivityTimer();
 
-        // Only broadcast if this change originated from THIS window
+        // Mark that we have pending changes (will be persisted by sync interval)
         if (!this.applyingBroadcast) {
-            // Broadcast will also persist to server
-            this.debouncedBroadcastMetaChangeFuncByHandle(payload.handle)(payload);
+            this.hasPendingChanges = true;
+            this.debug(`📝 Meta changed for ${payload.handle}, marked as pending`);
         }
     }
 
     rememberChange(type, handle, value) {
-        this.debug(`Remembering ${type} change`, { handle, value });
         const cache = type === 'value' ? this.lastValues : this.lastMetaValues;
         cache[handle] = clone(value);
-    }
-
-    getOrCreateDebouncedFunc(cache, handle, callback, delay) {
-        if (!cache[handle]) {
-            cache[handle] = _.debounce(callback, delay);
-        }
-        return cache[handle];
-    }
-
-    debouncedBroadcastValueChangeFuncByHandle(handle) {
-        return this.getOrCreateDebouncedFunc(
-            this.debouncedBroadcastValueChangeFuncsByHandle, handle,
-            (payload) => this.broadcastValueChange(payload), 500
-        );
-    }
-
-    debouncedBroadcastMetaChangeFuncByHandle(handle) {
-        return this.getOrCreateDebouncedFunc(
-            this.debouncedBroadcastMetaChangeFuncsByHandle, handle,
-            (payload) => this.broadcastMetaChange(payload), 500
-        );
     }
 
     hasChanged(type, handle, newValue) {
@@ -879,45 +874,6 @@ export default class Workspace {
         }
     }
 
-    async broadcastValueChange(payload) {
-        // Only broadcast if this change originated from THIS window (not from a broadcast we received)
-        if (this.applyingBroadcast) {
-            this.debug(`🚫 Skipping broadcast - applyingBroadcast is true`);
-            return;
-        }
-
-        // Only my own change events should be broadcasted
-        if (this.user.id == payload.user) {
-            // Always persist to server first, then notify others
-            await this.sendStateUpdate(payload.handle, payload.value, 'value');
-            // Only send notification - data will be fetched from server
-            this.channel.whisper('data-changed', {
-                handle: payload.handle,
-                type: 'value',
-                windowId: this.windowId
-            });
-            this.debug(`📣 Notified others about value change for "${payload.handle}"`);
-        }
-    }
-
-    async broadcastMetaChange(payload) {
-        // Only broadcast if this change originated from THIS window (not from a broadcast we received)
-        if (this.applyingBroadcast) return;
-
-        // Only my own change events should be broadcasted
-        if (this.user.id == payload.user) {
-            // Always persist to server first, then notify others
-            await this.sendStateUpdate(payload.handle, payload.value, 'meta');
-            // Only send notification - data will be fetched from server
-            this.channel.whisper('data-changed', {
-                handle: payload.handle,
-                type: 'meta',
-                windowId: this.windowId
-            });
-            this.debug(`📣 Notified others about meta change for "${payload.handle}"`);
-        }
-    }
-
     // Allow fieldtypes to provide an array of keys that will be broadcasted.
     // For example, in Bard, only the "existing" value in its meta object
     // ever gets updated. We'll just broadcast that, rather than the
@@ -957,61 +913,6 @@ export default class Workspace {
             .replace(/_/g, ' ')
             .replace(/([a-z])([A-Z])/g, '$1 $2')
             .replace(/^./, str => str.toUpperCase());
-    }
-
-    queuePendingUpdate(handle, type, windowId) {
-        // Track the pending update with timestamp
-        const key = `${handle}:${type}`;
-        this.pendingServerUpdates[key] = {
-            handle,
-            type,
-            windowId,
-            timestamp: Date.now()
-        };
-
-        this.debug(`📋 Queued update for "${handle}" (${type}), total pending: ${Object.keys(this.pendingServerUpdates).length}`);
-
-        // Start or reset the inactivity timer for triggering updates
-        this.resetUpdateInactivityTimer();
-    }
-
-    resetUpdateInactivityTimer() {
-        if (this.updateInactivityTimer) {
-            clearTimeout(this.updateInactivityTimer);
-        }
-
-        this.updateInactivityTimer = setTimeout(() => {
-            this.debug(`⏰ User inactive for ${this.updateInactivityDelay}ms, fetching pending updates`);
-            this.triggerPendingUpdates();
-        }, this.updateInactivityDelay);
-    }
-
-    triggerPendingUpdates() {
-        const pendingCount = Object.keys(this.pendingServerUpdates).length;
-        if (pendingCount === 0) {
-            return;
-        }
-
-        // Don't fetch if user has made recent local changes
-        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-        if (timeSinceLastChange < this.localChangeProtectionMs) {
-            this.debug(`🛡️ Skipping update fetch - local change was ${timeSinceLastChange}ms ago`);
-            return;
-        }
-
-        this.debug(`📥 Triggering fetch for ${pendingCount} pending updates`);
-
-        // Clear pending updates
-        this.pendingServerUpdates = {};
-
-        // Clear the timer
-        if (this.updateInactivityTimer) {
-            clearTimeout(this.updateInactivityTimer);
-            this.updateInactivityTimer = null;
-        }
-
-        // Fetch latest state from server
-        this.loadCachedState('triggerPendingUpdates');
     }
 
     debug(message, args) {
@@ -1215,27 +1116,21 @@ export default class Workspace {
         }
     }
 
-    async sendStateUpdate(handle, value, type) {
-        try {
-            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
-                || Statamic.$config.get('csrfToken');
+    async sendFullStateUpdate(values, meta) {
+        const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
+            || Statamic.$config.get('csrfToken');
 
-            await fetch(this.stateApiUrl, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'X-CSRF-TOKEN': csrfToken,
-                },
-                credentials: 'same-origin',
-                body: JSON.stringify({ handle, value, type }),
-            });
-
-            this.debug(`📦 Persisted ${type} change for "${handle}" to server`);
-        } catch (error) {
-            this.debug(`Failed to persist ${type} change`, { error });
-        }
+        await fetch(this.stateApiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-TOKEN': csrfToken,
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({ values, meta, full: true }),
+        });
     }
 
     async clearCachedState() {
