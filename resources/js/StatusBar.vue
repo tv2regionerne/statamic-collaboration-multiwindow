@@ -24,6 +24,7 @@
 
 <script>
 export default {
+    name: 'CollaborationStatusBar',
 
     props: {
         channelName: {
@@ -32,22 +33,32 @@ export default {
         }
     },
 
+    data() {
+        return {
+            ready: false
+        };
+    },
+
+    mounted() {
+        this.ready = true;
+    },
+
     computed: {
         collaborationState() {
             // Defensive check: store or collaboration module might not be ready yet
-            if (!this.$store || !this.$store.state || !this.$store.state.collaboration || !this.channelName) {
+            if (!this.ready || !this.$store?.state?.collaboration || !this.channelName) {
                 return null;
             }
             return this.$store.state.collaboration[this.channelName] || null;
         },
         users() {
-            return this.collaborationState?.users || [];
+            if (!this.collaborationState) return [];
+            return this.collaborationState.users || [];
         },
         connecting() {
             return this.users.length === 0;
         }
     }
-
 }
 </script>
 
