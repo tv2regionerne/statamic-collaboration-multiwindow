@@ -821,6 +821,13 @@ export default class Workspace {
         // Ignore broadcasts from this same window
         if (payload.windowId === this.windowId) return;
 
+        // Don't overwrite if user has made recent local changes (protects against losing typing)
+        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
+        if (timeSinceLastChange < this.localChangeProtectionMs) {
+            this.debug(`🛡️ Skipping value change - local change was ${timeSinceLastChange}ms ago`);
+            return;
+        }
+
         this.debug('✅ Applying broadcasted value change', payload);
 
         // Mark that we're applying a broadcast to prevent re-broadcasting
@@ -835,6 +842,13 @@ export default class Workspace {
     async applyBroadcastedMetaChange(payload) {
         // Ignore broadcasts from this same window
         if (payload.windowId === this.windowId) return;
+
+        // Don't overwrite if user has made recent local changes (protects against losing typing)
+        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
+        if (timeSinceLastChange < this.localChangeProtectionMs) {
+            this.debug(`🛡️ Skipping meta change - local change was ${timeSinceLastChange}ms ago`);
+            return;
+        }
 
         this.debug('✅ Applying broadcasted meta change', payload);
 
