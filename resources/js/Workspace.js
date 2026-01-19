@@ -768,27 +768,16 @@ export default class Workspace {
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
-            // Check if this is a complex field (has __collaboration key, e.g., Bard)
-            const isComplexField = data_get(payload, 'value.__collaboration') !== null;
+            // Clone payload to avoid mutating the original (persist needs full data)
+            const payloadClone = { ...payload, value: clone(payload.value) };
+            const cleanedPayload = { ...this.cleanMetaPayload(payloadClone), windowId: this.windowId };
 
-            if (isComplexField) {
-                // For complex fields, notify others to fetch from server (ensures full data including image URLs)
-                // The persist happens via the debounced persistMetaChange in vuexFieldMetaHasBeenSet
-                this.debug(`📦 Complex field "${payload.handle}", sending fetch notification`);
+            // For large payloads (>3KB), persist and notify others to fetch from server
+            if (JSON.stringify(cleanedPayload).length > 3000) {
+                this.debug(`📦 Large meta payload for "${payload.handle}", sending fetch notification`);
                 this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
             } else {
-                // For simple fields, broadcast directly via WebSocket (faster)
-                // Clone payload to avoid mutating the original (persist needs full data)
-                const payloadClone = { ...payload, value: clone(payload.value) };
-                const cleanedPayload = { ...this.cleanMetaPayload(payloadClone), windowId: this.windowId };
-
-                // For large payloads (>3KB), use fetch-field instead
-                if (JSON.stringify(cleanedPayload).length > 3000) {
-                    this.debug(`📦 Large meta payload for "${payload.handle}", sending fetch notification`);
-                    this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
-                } else {
-                    this.whisper('meta-updated', cleanedPayload);
-                }
+                this.whisper('meta-updated', cleanedPayload);
             }
         }
     }
