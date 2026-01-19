@@ -35,9 +35,6 @@ export default class Workspace {
         this.lastLocalChangeTime = 0;
         this.localChangeProtectionMs = 3000; // Don't overwrite if changed within last 3 seconds
 
-        // Track fields recently updated via broadcast (to avoid overwriting with stale server data)
-        this.recentBroadcastUpdates = {}; // { handle: timestamp }
-
         // Toast notification flags (to avoid duplicate toasts)
         this.notSavedToastShown = false;
         this.unsavedToastShown = false;
@@ -393,12 +390,6 @@ export default class Workspace {
         this.channel.listenForWhisper('sync-now', ({ windowId }) => {
             if (windowId === this.windowId) return;
 
-            // Don't sync if we're currently editing (have a focused field)
-            if (this.currentFocusedField) {
-                this.debug(`📥 Received sync-now but skipping - currently editing`);
-                return;
-            }
-
             this.debug(`📥 Received sync-now from ${windowId?.slice(-6)}, fetching from server`);
             this.loadCachedState('sync-now');
         });
@@ -734,7 +725,12 @@ export default class Workspace {
 
         this.debug(`🔒 Scheduling unlock for "${handle}" in ${this.fieldUnlockDelay}ms`);
 
-        this.pendingFieldUnlocks[handle] = setTimeout(() => {
+        this.pendingFieldUnlocks[handle] = setTimeout(async () => {
+            this.debug(`🔓 Fetching data before unlocking "${handle}"`);
+
+            // Fetch latest data from server BEFORE unlocking
+            await this.loadCachedState('before-unlock');
+
             this.debug(`🔓 Executing delayed unlock for "${handle}"`);
             Statamic.$store.commit(`publish/${this.container.name}/unlockField`, handle);
             delete this.pendingFieldUnlocks[handle];
@@ -1008,21 +1004,6 @@ export default class Workspace {
         );
     }
 
-    cancelPendingBroadcasts() {
-        // Cancel all pending debounced broadcast functions
-        Object.values(this.debouncedBroadcastValueChangeFuncsByHandle).forEach(func => {
-            if (func && typeof func.cancel === 'function') {
-                func.cancel();
-            }
-        });
-        Object.values(this.debouncedBroadcastMetaChangeFuncsByHandle).forEach(func => {
-            if (func && typeof func.cancel === 'function') {
-                func.cancel();
-            }
-        });
-        this.debug('🚫 Cancelled pending debounced broadcasts');
-    }
-
     async loadCachedState(source = 'unknown') {
         // Prevent concurrent loadCachedState calls
         if (this.loadingCachedState) {
@@ -1031,18 +1012,17 @@ export default class Workspace {
         }
 
         // Don't overwrite if user has made recent local changes (protects against losing typing)
-        // This applies to all sources now, not just fetch-field listener
-        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-        if (timeSinceLastChange < this.localChangeProtectionMs) {
-            this.debug(`🛡️ Skipping loadCachedState (${source}) - local change was ${timeSinceLastChange}ms ago (protection: ${this.localChangeProtectionMs}ms)`);
-            return;
+        // Exception: before-unlock always fetches to ensure we have latest data
+        if (source !== 'before-unlock') {
+            const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
+            if (timeSinceLastChange < this.localChangeProtectionMs) {
+                this.debug(`🛡️ Skipping loadCachedState (${source}) - local change was ${timeSinceLastChange}ms ago`);
+                return;
+            }
         }
 
         this.loadingCachedState = true;
         this.debug(`🔄 loadCachedState called from: ${source}`);
-
-        // Cancel any pending debounced broadcasts to prevent them from firing during fetch
-        this.cancelPendingBroadcasts();
 
         // Set applyingBroadcast BEFORE fetch to prevent any broadcasts during the entire operation
         this.debug('🔒 Setting applyingBroadcast = true (before fetch)');
@@ -1066,44 +1046,46 @@ export default class Workspace {
                 return;
             }
 
-            this.debug('✅ Applying cached state from server', data);
+            this.debug('✅ Applying cached state from server', {
+                valuesKeys: data.values ? Object.keys(data.values) : [],
+                metaKeys: data.meta ? Object.keys(data.meta) : []
+            });
 
             // Apply cached values - merge with current values
-            // Skip fields that were recently updated via broadcast (server may have stale data)
-            // Use commit instead of dispatch to avoid triggering autosave
             if (data.values && Object.keys(data.values).length > 0) {
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                const mergedValues = { ...currentValues };
+                const mergedValues = { ...currentValues, ...data.values };
 
-                Object.keys(data.values).forEach(handle => {
-                    const recentUpdate = this.recentBroadcastUpdates[handle];
-                    if (recentUpdate && (Date.now() - recentUpdate) < this.localChangeProtectionMs) {
-                        this.debug(`🛡️ Skipping server value for "${handle}" - recently updated via broadcast`);
-                    } else {
-                        mergedValues[handle] = data.values[handle];
-                    }
+                this.debug('📝 Committing setValues...', {
+                    changedKeys: Object.keys(data.values)
                 });
-
-                this.debug('📝 Committing setValues...');
                 Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
+
+                // Update lastValues so we don't re-send these as changes
+                Object.keys(data.values).forEach(handle => {
+                    this.lastValues[handle] = clone(data.values[handle]);
+                });
                 this.debug('📝 setValues commit completed');
             }
 
             // Apply cached meta - merge with current meta
-            // Skip fields that were recently updated via broadcast
-            // Use commit instead of dispatch to avoid triggering autosave
             if (data.meta && Object.keys(data.meta).length > 0) {
                 const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
                 const mergedMeta = { ...currentMeta };
                 Object.keys(data.meta).forEach(handle => {
-                    const recentUpdate = this.recentBroadcastUpdates[handle];
-                    if (recentUpdate && (Date.now() - recentUpdate) < this.localChangeProtectionMs) {
-                        this.debug(`🛡️ Skipping server meta for "${handle}" - recently updated via broadcast`);
-                    } else {
-                        mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
-                    }
+                    mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
+                });
+
+                this.debug('📝 Committing setMeta...', {
+                    changedKeys: Object.keys(data.meta)
                 });
                 Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
+
+                // Update lastMetaValues so we don't re-send these as changes
+                Object.keys(data.meta).forEach(handle => {
+                    this.lastMetaValues[handle] = clone(mergedMeta[handle]);
+                });
+                this.debug('📝 setMeta commit completed');
             }
 
             this.initialStateUpdated = true;
@@ -1120,7 +1102,13 @@ export default class Workspace {
         const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
             || Statamic.$config.get('csrfToken');
 
-        await fetch(this.stateApiUrl, {
+        this.debug('📤 Sending full state update to server', {
+            valuesKeys: Object.keys(values || {}),
+            metaKeys: Object.keys(meta || {}),
+            url: this.stateApiUrl
+        });
+
+        const response = await fetch(this.stateApiUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1131,6 +1119,13 @@ export default class Workspace {
             credentials: 'same-origin',
             body: JSON.stringify({ values, meta, full: true }),
         });
+
+        if (!response.ok) {
+            this.debug('❌ Failed to send state update', { status: response.status });
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        this.debug('✅ State update sent successfully');
     }
 
     async clearCachedState() {
