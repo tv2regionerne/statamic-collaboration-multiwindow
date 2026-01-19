@@ -73,6 +73,8 @@ export default class Workspace {
     start() {
         if (this.started) return;
 
+        console.log(`[Collab ${this.windowId.slice(-6)}] Starting workspace for ${this.container.reference}`);
+
         this.initializeStateApi();
         this.initializeChannel();
         this.initializeStore();
@@ -82,7 +84,7 @@ export default class Workspace {
         this.loadInitialState();
 
         this.started = true;
-        this.debug('Workspace started');
+        this.debug('Workspace started successfully');
     }
 
     /**
@@ -136,11 +138,13 @@ export default class Workspace {
 
         // When we join, get list of users and announce ourselves
         this.channel.here(users => {
+            this.debug(`Channel joined! Users in channel:`, users.map(u => u.name));
             Statamic.$store.commit(`collaboration/${this.channelName}/setUsers`, users);
             this.channel.whisper('window-joined', {
                 windowId: this.windowId,
                 user: this.user
             });
+            this.debug(`Sent window-joined whisper`);
         });
 
         // User joined the channel
@@ -163,31 +167,51 @@ export default class Workspace {
 
         // Listen for field change notifications
         this.channel.listenForWhisper('field-changed', ({ windowId, handle }) => {
+            this.debug(`RECEIVED field-changed whisper: handle="${handle}", from=${windowId?.slice(-6)}`);
+
             // Ignore our own notifications
-            if (windowId === this.windowId) return;
+            if (windowId === this.windowId) {
+                this.debug('  -> Ignoring own whisper');
+                return;
+            }
 
             // Ignore if this field is locked by us
-            if (this.currentFocus === handle) return;
+            if (this.currentFocus === handle) {
+                this.debug('  -> Ignoring, we are editing this field');
+                return;
+            }
 
-            this.debug(`Field "${handle}" changed by another window, fetching...`);
+            this.debug(`  -> Fetching field "${handle}" from server...`);
             this.fetchAndApplyField(handle);
         });
 
         // Listen for focus events (field locking)
         this.channel.listenForWhisper('focus', ({ windowId, user, handle }) => {
+            this.debug(`RECEIVED focus whisper: handle="${handle}", from=${windowId?.slice(-6)}, user=${user?.name}`);
+
             // Ignore our own window's focus events
-            if (windowId === this.windowId) return;
+            if (windowId === this.windowId) {
+                this.debug('  -> Ignoring own whisper');
+                return;
+            }
 
             // Lock field even for same user's other windows
+            this.debug(`  -> Locking field "${handle}"`);
             this.lockField(user, handle);
         });
 
         // Listen for blur events (field unlocking after delay)
         this.channel.listenForWhisper('blur', ({ windowId, user, handle }) => {
+            this.debug(`RECEIVED blur whisper: handle="${handle}", from=${windowId?.slice(-6)}`);
+
             // Ignore our own window's blur events
-            if (windowId === this.windowId) return;
+            if (windowId === this.windowId) {
+                this.debug('  -> Ignoring own whisper');
+                return;
+            }
 
             // Unlock after 3 seconds
+            this.debug(`  -> Scheduling unlock for "${handle}" in 3s`);
             this.scheduleFieldUnlock(user, handle);
         });
 
@@ -240,6 +264,11 @@ export default class Workspace {
 
         // Subscribe to Vuex mutations to detect field changes
         this.storeSubscriber = Statamic.$store.subscribe((mutation) => {
+            // Only log mutations we care about
+            if (mutation.type.startsWith(`publish/${this.container.name}/setField`)) {
+                this.debug(`Vuex mutation: ${mutation.type}`, { handle: mutation.payload?.handle, applyingRemote: this.applyingRemoteChange });
+            }
+
             if (this.applyingRemoteChange) return;
 
             if (mutation.type === `publish/${this.container.name}/setFieldValue`) {
@@ -260,6 +289,7 @@ export default class Workspace {
      */
     initializeFocus() {
         this.container.$on('focus', handle => {
+            this.debug(`FOCUS on "${handle}"`);
             this.currentFocus = handle;
             this.channel.whisper('focus', {
                 windowId: this.windowId,
@@ -273,6 +303,7 @@ export default class Workspace {
         });
 
         this.container.$on('blur', handle => {
+            this.debug(`BLUR from "${handle}", changedFields:`, [...this.changedFields]);
             this.currentFocus = null;
             this.channel.whisper('blur', {
                 windowId: this.windowId,
@@ -346,14 +377,19 @@ export default class Workspace {
     onFieldValueChanged(payload) {
         const { handle, value } = payload;
 
+        this.debug(`onFieldValueChanged called for "${handle}"`);
+
         // Check if value actually changed from last synced state
-        if (JSON.stringify(this.lastValues[handle]) === JSON.stringify(value)) {
+        const lastVal = JSON.stringify(this.lastValues[handle]);
+        const newVal = JSON.stringify(value);
+        if (lastVal === newVal) {
+            this.debug(`  -> No change detected for "${handle}"`);
             return;
         }
 
         // Mark field as changed (don't update lastValues until sync)
         this.changedFields.add(handle);
-        this.debug(`Field "${handle}" value changed`);
+        this.debug(`  -> Field "${handle}" marked as changed, total: ${this.changedFields.size}`);
 
         // Reset inactivity timer
         this.resetInactivityTimer();
@@ -404,8 +440,11 @@ export default class Workspace {
     async syncChangedFields() {
         this.clearInactivityTimer();
 
+        this.debug(`syncChangedFields called, changedFields.size = ${this.changedFields.size}`);
+
         // Nothing to sync?
         if (this.changedFields.size === 0) {
+            this.debug('  -> Nothing to sync');
             return;
         }
 
@@ -417,15 +456,18 @@ export default class Workspace {
         // Persist each changed field to server
         for (const handle of this.changedFields) {
             if (currentValues[handle] !== undefined) {
+                this.debug(`  -> Persisting value for "${handle}"...`);
                 await this.persistField(handle, currentValues[handle], 'value');
                 this.lastValues[handle] = clone(currentValues[handle]);
             }
             if (currentMeta[handle] !== undefined) {
+                this.debug(`  -> Persisting meta for "${handle}"...`);
                 await this.persistField(handle, currentMeta[handle], 'meta');
                 this.lastMeta[handle] = clone(currentMeta[handle]);
             }
 
             // Notify others to fetch this field
+            this.debug(`  -> Sending field-changed whisper for "${handle}"`);
             this.channel.whisper('field-changed', {
                 windowId: this.windowId,
                 handle
@@ -434,6 +476,7 @@ export default class Workspace {
 
         // Clear the changed fields set
         this.changedFields.clear();
+        this.debug('  -> Sync complete');
     }
 
     // =========================================================================
@@ -642,10 +685,9 @@ export default class Workspace {
     // =========================================================================
 
     /**
-     * Debug logging (only when enabled in config)
+     * Debug logging (always enabled for now to diagnose issues)
      */
     debug(message, data = null) {
-        if (!Statamic.$config.get('collaboration.debug')) return;
         const prefix = `[Collab ${this.windowId.slice(-6)}]`;
         if (data) {
             console.log(prefix, message, data);
