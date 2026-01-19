@@ -58,9 +58,12 @@ export default class Workspace {
         this.fieldUnlockDelay = 3000;
         this.pendingFieldUnlocks = {}; // { handle: timeoutId }
 
-        // Field inactivity: auto-unlock after 60 seconds of no activity
-        this.fieldInactivityTimeout = 60000;
+        // Field inactivity: auto-unlock after 30 seconds of no activity
+        this.fieldInactivityTimeout = 30000;
         this.fieldInactivityTimer = null;
+
+        // API timeout (4 seconds)
+        this.apiTimeout = 4000;
     }
 
     generateWindowId() {
@@ -609,7 +612,7 @@ export default class Workspace {
 
             // Persist any pending changes immediately and WAIT for it to complete
             if (this.hasPendingChanges) {
-                await this.persistAllChangesSync();
+                await this.persistAllChanges();
             }
 
             // Tell other clients to sync now (fetch latest from server)
@@ -660,7 +663,7 @@ export default class Workspace {
 
         this.fieldInactivityTimer = setTimeout(() => {
             if (this.currentFocusedField) {
-                this.debug(`⏰ Field "${this.currentFocusedField}" inactive for 60 seconds, auto-unlocking`);
+                this.debug(`⏰ Field "${this.currentFocusedField}" inactive for 30 seconds, auto-unlocking`);
                 this.autoUnlockField(this.currentFocusedField);
             }
         }, this.fieldInactivityTimeout);
@@ -673,7 +676,7 @@ export default class Workspace {
         }
     }
 
-    autoUnlockField(handle) {
+    async autoUnlockField(handle) {
         // Force blur the active element
         if (document.activeElement) {
             document.activeElement.blur();
@@ -684,12 +687,12 @@ export default class Workspace {
         this.clearFieldInactivityTimer();
         this.currentFocusedField = null;
 
-        // Persist any pending changes
+        // Persist any pending changes and WAIT for completion before notifying others
         if (this.hasPendingChanges) {
-            this.persistAllChanges();
+            await this.persistAllChanges();
         }
 
-        // Tell other clients to sync now
+        // Tell other clients to sync now (data is now on server)
         this.channel.whisper('sync-now', { windowId: this.windowId });
 
         // Inform about blur and schedule delayed unlock
@@ -917,6 +920,24 @@ export default class Workspace {
         console.log(`[Collaboration ${this.windowId?.slice(-6) || 'init'}]`, message, { ...args });
     }
 
+    /**
+     * Fetch with timeout wrapper
+     */
+    async fetchWithTimeout(url, options = {}) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), this.apiTimeout);
+
+        try {
+            const response = await fetch(url, {
+                ...options,
+                signal: controller.signal,
+            });
+            return response;
+        } finally {
+            clearTimeout(timeoutId);
+        }
+    }
+
     isAlone() {
         // During warm-up period, assume we're not alone (ensures sync works while windows are joining)
         if (this.warmUpPeriod) {
@@ -1030,7 +1051,7 @@ export default class Workspace {
         this.applyingBroadcast = true;
 
         try {
-            const response = await fetch(this.stateApiUrl, {
+            const response = await this.fetchWithTimeout(this.stateApiUrl, {
                 headers: {
                     'Accept': 'application/json',
                     'X-Requested-With': 'XMLHttpRequest',
@@ -1111,7 +1132,7 @@ export default class Workspace {
             url: this.stateApiUrl
         });
 
-        const response = await fetch(this.stateApiUrl, {
+        const response = await this.fetchWithTimeout(this.stateApiUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -1136,7 +1157,7 @@ export default class Workspace {
             const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
                 || Statamic.$config.get('csrfToken');
 
-            await fetch(this.stateApiUrl, {
+            await this.fetchWithTimeout(this.stateApiUrl, {
                 method: 'DELETE',
                 headers: {
                     'Accept': 'application/json',
