@@ -626,6 +626,9 @@ export default class Workspace {
             this.clearFieldInactivityTimer(handle);
             this.currentFocusedField = null;
 
+            // Trigger any pending updates when leaving a field
+            this.triggerPendingUpdates();
+
             // Delay unlock by 3 seconds - still inform others immediately via focus state
             this.blur(user);
             this.whisper('blur', { user, handle, windowId: this.windowId });
