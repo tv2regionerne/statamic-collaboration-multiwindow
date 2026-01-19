@@ -24,13 +24,8 @@ export default class Workspace {
         this.started = false;
         this.storeSubscriber = null;
 
-        // User info (minimal data for whispers to avoid Pusher's 10KB limit)
-        this.user = {
-            id: Statamic.user.id,
-            name: Statamic.user.name,
-            initials: Statamic.user.initials,
-            avatar: Statamic.user.avatar,
-        };
+        // User info
+        this.user = Statamic.user;
 
         // Unique ID for this browser tab
         this.windowId = this.generateWindowId();
@@ -58,7 +53,6 @@ export default class Workspace {
 
         // Track fields currently locked by other users
         this.lockedFields = {};
-
     }
 
     /**
@@ -76,8 +70,6 @@ export default class Workspace {
     start() {
         if (this.started) return;
 
-        console.log(`[Collab ${this.windowId.slice(-6)}] Starting workspace for ${this.container.reference}`);
-
         this.initializeStateApi();
         this.initializeChannel();
         this.initializeStore();
@@ -87,7 +79,7 @@ export default class Workspace {
         this.loadInitialState();
 
         this.started = true;
-        this.debug('Workspace started successfully');
+        this.debug('Workspace started');
     }
 
     /**
@@ -141,8 +133,11 @@ export default class Workspace {
 
         // When we join, get list of users and announce ourselves
         this.channel.here(users => {
-            this.debug(`Channel joined! Users in channel:`, users.map(u => u.name));
             Statamic.$store.commit(`collaboration/${this.channelName}/setUsers`, users);
+            this.channel.whisper('window-joined', {
+                windowId: this.windowId,
+                user: this.user
+            });
         });
 
         // User joined the channel
@@ -165,51 +160,30 @@ export default class Workspace {
 
         // Listen for field change notifications
         this.channel.listenForWhisper('field-changed', ({ windowId, handle }) => {
-            this.debug(`RECEIVED field-changed whisper: handle="${handle}", from=${windowId?.slice(-6)}`);
-
             // Ignore our own notifications
-            if (windowId === this.windowId) {
-                this.debug('  -> Ignoring own whisper');
-                return;
-            }
+            if (windowId === this.windowId) return;
 
             // Ignore if this field is locked by us
-            if (this.currentFocus === handle) {
-                this.debug('  -> Ignoring, we are editing this field');
-                return;
-            }
+            if (this.currentFocus === handle) return;
 
-            this.debug(`  -> Fetching field "${handle}" from server...`);
+            this.debug(`Field "${handle}" changed by another window, fetching...`);
             this.fetchAndApplyField(handle);
         });
 
         // Listen for focus events (field locking)
         this.channel.listenForWhisper('focus', ({ windowId, user, handle }) => {
-            this.debug(`RECEIVED focus whisper: handle="${handle}", from=${windowId?.slice(-6)}, user=${user?.name}`);
+            if (windowId === this.windowId) return;
+            if (user.id === this.user.id) return; // Don't lock for our own other windows
 
-            // Ignore our own window's focus events
-            if (windowId === this.windowId) {
-                this.debug('  -> Ignoring own whisper');
-                return;
-            }
-
-            // Lock field even for same user's other windows
-            this.debug(`  -> Locking field "${handle}"`);
             this.lockField(user, handle);
         });
 
         // Listen for blur events (field unlocking after delay)
         this.channel.listenForWhisper('blur', ({ windowId, user, handle }) => {
-            this.debug(`RECEIVED blur whisper: handle="${handle}", from=${windowId?.slice(-6)}`);
-
-            // Ignore our own window's blur events
-            if (windowId === this.windowId) {
-                this.debug('  -> Ignoring own whisper');
-                return;
-            }
+            if (windowId === this.windowId) return;
+            if (user.id === this.user.id) return;
 
             // Unlock after 3 seconds
-            this.debug(`  -> Scheduling unlock for "${handle}" in 3s`);
             this.scheduleFieldUnlock(user, handle);
         });
 
@@ -262,11 +236,6 @@ export default class Workspace {
 
         // Subscribe to Vuex mutations to detect field changes
         this.storeSubscriber = Statamic.$store.subscribe((mutation) => {
-            // Only log mutations we care about
-            if (mutation.type.startsWith(`publish/${this.container.name}/setField`)) {
-                this.debug(`Vuex mutation: ${mutation.type}`, { handle: mutation.payload?.handle, applyingRemote: this.applyingRemoteChange });
-            }
-
             if (this.applyingRemoteChange) return;
 
             if (mutation.type === `publish/${this.container.name}/setFieldValue`) {
@@ -287,7 +256,6 @@ export default class Workspace {
      */
     initializeFocus() {
         this.container.$on('focus', handle => {
-            this.debug(`FOCUS on "${handle}"`);
             this.currentFocus = handle;
             this.channel.whisper('focus', {
                 windowId: this.windowId,
@@ -301,7 +269,6 @@ export default class Workspace {
         });
 
         this.container.$on('blur', handle => {
-            this.debug(`BLUR from "${handle}"`);
             this.currentFocus = null;
             this.channel.whisper('blur', {
                 windowId: this.windowId,
@@ -434,7 +401,7 @@ export default class Workspace {
         const currentValues = Statamic.$store.state.publish[this.container.name].values;
         const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
 
-        // Find changed values by comparing current state with last synced state
+        // Find changed values
         const changedHandles = new Set();
 
         for (const handle of Object.keys(currentValues)) {
@@ -488,9 +455,7 @@ export default class Workspace {
             const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
                 || Statamic.$config.get('csrfToken');
 
-            this.debug(`POST ${this.stateApiUrl}`, { handle, type, csrfToken: csrfToken ? 'present' : 'MISSING' });
-
-            const response = await fetch(this.stateApiUrl, {
+            await fetch(this.stateApiUrl, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -502,18 +467,9 @@ export default class Workspace {
                 body: JSON.stringify({ handle, value, type }),
             });
 
-            if (!response.ok) {
-                const text = await response.text();
-                this.debug(`FAILED to persist ${type} for "${handle}": ${response.status}`, text);
-                return false;
-            }
-
-            const data = await response.json();
-            this.debug(`Persisted ${type} for "${handle}"`, data);
-            return true;
+            this.debug(`Persisted ${type} for "${handle}"`);
         } catch (error) {
-            this.debug(`ERROR persisting ${type} for "${handle}"`, error);
-            return false;
+            this.debug(`Failed to persist ${type} for "${handle}"`, error);
         }
     }
 
@@ -522,8 +478,6 @@ export default class Workspace {
      */
     async fetchAllState() {
         try {
-            this.debug(`GET ${this.stateApiUrl}`);
-
             const response = await fetch(this.stateApiUrl, {
                 headers: {
                     'Accept': 'application/json',
@@ -532,23 +486,14 @@ export default class Workspace {
                 credentials: 'same-origin',
             });
 
-            if (!response.ok) {
-                this.debug(`FAILED to fetch state: ${response.status}`);
-                return;
-            }
+            if (!response.ok) return;
 
             const data = await response.json();
-            this.debug('Fetched state from server:', data);
+            if (!data.exists) return;
 
-            if (!data.exists) {
-                this.debug('No cached state exists on server');
-                return;
-            }
-
-            this.debug('Applying state from server...');
             this.applyState(data.values, data.meta);
         } catch (error) {
-            this.debug('ERROR fetching state', error);
+            this.debug('Failed to fetch state', error);
         }
     }
 
@@ -557,8 +502,6 @@ export default class Workspace {
      */
     async fetchAndApplyField(handle) {
         try {
-            this.debug(`GET ${this.stateApiUrl} (for field "${handle}")`);
-
             const response = await fetch(this.stateApiUrl, {
                 headers: {
                     'Accept': 'application/json',
@@ -567,27 +510,18 @@ export default class Workspace {
                 credentials: 'same-origin',
             });
 
-            if (!response.ok) {
-                this.debug(`FAILED to fetch field "${handle}": ${response.status}`);
-                return;
-            }
+            if (!response.ok) return;
 
             const data = await response.json();
-            this.debug(`Fetched for field "${handle}":`, data);
-
-            if (!data.exists) {
-                this.debug(`No cached state for field "${handle}"`);
-                return;
-            }
+            if (!data.exists) return;
 
             // Apply only the specific field
             const values = data.values?.[handle] !== undefined ? { [handle]: data.values[handle] } : null;
             const meta = data.meta?.[handle] !== undefined ? { [handle]: data.meta[handle] } : null;
 
-            this.debug(`Applying field "${handle}":`, { values, meta });
             this.applyState(values, meta);
         } catch (error) {
-            this.debug(`ERROR fetching field "${handle}"`, error);
+            this.debug(`Failed to fetch field "${handle}"`, error);
         }
     }
 
@@ -632,10 +566,7 @@ export default class Workspace {
                 Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
             }
         } finally {
-            // Delay resetting the flag to allow Vuex cascading mutations to complete
-            setTimeout(() => {
-                this.applyingRemoteChange = false;
-            }, 300);
+            this.applyingRemoteChange = false;
         }
     }
 
@@ -718,9 +649,10 @@ export default class Workspace {
     // =========================================================================
 
     /**
-     * Debug logging (always enabled for now to diagnose issues)
+     * Debug logging (only when enabled in config)
      */
     debug(message, data = null) {
+        if (!Statamic.$config.get('collaboration.debug')) return;
         const prefix = `[Collab ${this.windowId.slice(-6)}]`;
         if (data) {
             console.log(prefix, message, data);
