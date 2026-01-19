@@ -1,198 +1,121 @@
-import buddyIn from '../audio/buddy-in.mp3'
-import buddyOut from '../audio/buddy-out.mp3'
+/**
+ * Workspace - Real-time collaboration for Statamic entries
+ *
+ * Architecture:
+ * - Data flows through the server (StateController), not WebSocket
+ * - Pusher/WebSocket only used for lightweight notifications
+ * - Each browser tab has a unique windowId to filter own messages
+ *
+ * Sync flow:
+ * 1. User edits a field
+ * 2. On blur OR 5 seconds inactivity, changes are persisted to server
+ * 3. After persist, a notification is sent via Pusher (field handle only)
+ * 4. Other windows receive notification and fetch data from server
+ * 5. Data is applied with field locking to prevent conflicts
+ */
 
 export default class Workspace {
 
     constructor(container) {
         this.container = container;
         this.echo = null;
+        this.channel = null;
+        this.channelName = null;
         this.started = false;
         this.storeSubscriber = null;
-        this.lastValues = {};
-        this.lastMetaValues = {};
-        this.user = Statamic.user;
-        this.initialStateUpdated = false;
-        this.stateApiUrl = null;
 
-        // Unique ID for this window/tab to distinguish from same user in other windows
+        // User info
+        this.user = Statamic.user;
+
+        // Unique ID for this browser tab
         this.windowId = this.generateWindowId();
 
-        // Track all active windows (not just users) for proper broadcast logic
-        this.activeWindows = new Set();
+        // Server API URL for state persistence
+        this.stateApiUrl = null;
 
-        // Track which changes came from broadcasts (to avoid re-broadcasting)
-        this.applyingBroadcast = false;
+        // Track last known values to detect changes
+        this.lastValues = {};
+        this.lastMeta = {};
 
-        // Inactivity tracking (12 hours = 43200000ms)
-        this.inactivityTimeout = 12 * 60 * 60 * 1000;
+        // Track which field the user is currently editing
+        this.currentFocus = null;
+
+        // Inactivity timer for auto-sync (5 seconds)
         this.inactivityTimer = null;
-        this.inactivityWarningShown = false;
+        this.inactivityDelayMs = 5000;
 
-        // Prevent concurrent loadCachedState calls
-        this.loadingCachedState = false;
+        // Field lock duration after blur (3 seconds)
+        this.fieldLockDurationMs = 3000;
+        this.fieldLockTimers = {};
 
-        // Track when we last made a local change (to avoid overwriting recent edits)
-        this.lastLocalChangeTime = 0;
-        this.localChangeProtectionMs = 3000; // Don't overwrite if changed within last 3 seconds
+        // Prevent re-broadcasting received changes
+        this.applyingRemoteChange = false;
 
-        // Track fields recently updated via broadcast (to avoid overwriting with stale server data)
-        this.recentBroadcastUpdates = {}; // { handle: timestamp }
-
-        this.debouncedBroadcastValueChangeFuncsByHandle = {};
-        this.debouncedBroadcastMetaChangeFuncsByHandle = {};
-        this.debouncedPersistValueFuncsByHandle = {};
-        this.debouncedPersistMetaFuncsByHandle = {};
-
-        // Toast notification flags (to avoid duplicate toasts)
-        this.notSavedToastShown = false;
-        this.unsavedToastShown = false;
-
-        // Warm-up period: always broadcast for first few seconds after joining
-        // This ensures sync works even before activeWindows is fully populated
-        this.warmUpPeriod = true;
-        this.warmUpDurationMs = 5000;
-
-        // BroadcastChannel for reliable same-browser window detection
-        this.localChannel = null;
-        this.localWindows = new Set();
+        // Track fields currently locked by other users
+        this.lockedFields = {};
     }
 
+    /**
+     * Generate a unique ID for this browser tab
+     */
     generateWindowId() {
         const timestamp = Date.now().toString(36);
-        const randomPart = crypto.getRandomValues(new Uint32Array(2))
-            .reduce((acc, val) => acc + val.toString(36), '')
-            .slice(0, 9);
-
-        return `${timestamp}-${randomPart}`;
+        const random = Math.random().toString(36).slice(2, 8);
+        return `${timestamp}-${random}`;
     }
 
+    /**
+     * Start the collaboration workspace
+     */
     start() {
         if (this.started) return;
 
         this.initializeStateApi();
-        this.initializeLocalChannel();
-        this.initializeEcho();
+        this.initializeChannel();
         this.initializeStore();
         this.initializeFocus();
-        this.initializeValuesAndMeta();
         this.initializeHooks();
         this.initializeStatusBar();
-        this.initializeVisibilityHandler();
+        this.loadInitialState();
+
         this.started = true;
+        this.debug('Workspace started');
     }
 
     /**
-     * Initialize BroadcastChannel for reliable same-browser window detection.
-     * This works instantly between tabs without relying on WebSocket.
+     * Clean up when workspace is destroyed
      */
-    initializeLocalChannel() {
-        const channelName = `collaboration-${this.container.reference}-${this.container.site}`;
-        this.localChannel = new BroadcastChannel(channelName);
-
-        this.localChannel.onmessage = (event) => {
-            const { type, windowId } = event.data;
-
-            if (windowId === this.windowId) return;
-
-            switch (type) {
-                case 'window-joined':
-                    this.debug(`🖥️ Local window joined: ${windowId}`);
-                    this.localWindows.add(windowId);
-                    // Respond so the new window knows about us
-                    this.localChannel.postMessage({ type: 'window-present', windowId: this.windowId });
-                    break;
-
-                case 'window-present':
-                    this.debug(`🖥️ Local window present: ${windowId}`);
-                    this.localWindows.add(windowId);
-                    break;
-
-                case 'window-left':
-                    this.debug(`🖥️ Local window left: ${windowId}`);
-                    this.localWindows.delete(windowId);
-                    break;
-            }
-        };
-
-        // Announce ourselves to other local windows
-        this.localChannel.postMessage({ type: 'window-joined', windowId: this.windowId });
-        this.debug('🖥️ Local channel initialized');
-    }
-
-    initializeVisibilityHandler() {
-        // Track the previous visibility state to avoid spurious events
-        this.wasHidden = document.visibilityState === 'hidden';
-
-        this.visibilityHandler = async () => {
-            const isNowVisible = document.visibilityState === 'visible';
-            const isNowHidden = document.visibilityState === 'hidden';
-
-            if (isNowHidden) {
-                this.wasHidden = true;
-                this.debug('👁️ Window became hidden');
-                return;
-            }
-
-            if (isNowVisible && this.wasHidden) {
-                this.wasHidden = false;
-
-                // Skip sync if we have recent local changes (user is actively editing)
-                const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-                if (timeSinceLastChange < this.localChangeProtectionMs) {
-                    this.debug(`👁️ Window became visible but skipping sync - local change was ${timeSinceLastChange}ms ago`);
-                    return;
-                }
-
-                this.debug('👁️ Window became visible after being hidden, syncing state...');
-
-                // Wait for WebSocket connection to be ready before syncing
-                const { wasDisconnected, reconnected } = await this.waitForConnection();
-
-                // Fetch latest state from server
-                await this.loadCachedState('visibilityHandler');
-
-                // Re-announce ourselves to get fresh state from other windows
-                this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
-
-                // Show toast if we had to reconnect
-                if (wasDisconnected && reconnected) {
-                    Statamic.$toast.success('Connection restored. Syncing latest changes...', { duration: 2000 });
-                } else if (wasDisconnected && !reconnected) {
-                    Statamic.$toast.error('Connection could not be restored. Please refresh the page.', { duration: false });
-                }
-            } else if (isNowVisible) {
-                this.debug('👁️ Visibility event fired but window was not hidden, skipping sync');
-            }
-        };
-
-        document.addEventListener('visibilitychange', this.visibilityHandler);
-    }
-
-    async waitForConnection(maxWaitMs = 5000) {
-        const pusher = this.echo?.connector?.pusher;
-        if (!pusher) return { wasDisconnected: false };
-
-        if (pusher.connection?.state === 'connected') return { wasDisconnected: false };
-
-        this.debug(`🔄 Waiting for reconnection...`);
-
-        return new Promise((resolve) => {
-            const timeout = setTimeout(() => {
-                this.debug(`⚠️ Connection timeout`);
-                resolve({ wasDisconnected: true, reconnected: false });
-            }, maxWaitMs);
-
-            const checkInterval = setInterval(() => {
-                if (pusher.connection?.state === 'connected') {
-                    clearTimeout(timeout);
-                    clearInterval(checkInterval);
-                    this.debug('✅ Connection restored');
-                    resolve({ wasDisconnected: true, reconnected: true });
-                }
-            }, 100);
+    destroy() {
+        // Notify others that we're leaving
+        this.channel?.whisper('window-left', {
+            windowId: this.windowId,
+            user: this.user
         });
+
+        // Clear timers
+        this.clearInactivityTimer();
+        Object.values(this.fieldLockTimers).forEach(timer => clearTimeout(timer));
+
+        // Unsubscribe from store
+        if (this.storeSubscriber) {
+            this.storeSubscriber();
+        }
+
+        // Leave channel
+        if (this.echo && this.channelName) {
+            this.echo.leave(this.channelName);
+        }
+
+        this.debug('Workspace destroyed');
     }
 
+    // =========================================================================
+    // INITIALIZATION
+    // =========================================================================
+
+    /**
+     * Set up the server API URL for state persistence
+     */
     initializeStateApi() {
         const reference = this.container.reference.replaceAll('::', '.');
         const site = this.container.site.replaceAll('.', '_');
@@ -200,295 +123,97 @@ export default class Workspace {
         this.stateApiUrl = `${cpUrl}/collaboration/state/${reference}/${site}`;
     }
 
-    destroy() {
-        // Clear inactivity timer
-        this.clearActivityTimer();
-
-        // Remove visibility handler
-        if (this.visibilityHandler) {
-            document.removeEventListener('visibilitychange', this.visibilityHandler);
-        }
-
-        // Announce that this window is leaving (via WebSocket)
-        this.channel.whisper('window-left', { windowId: this.windowId });
-
-        // Announce that this window is leaving (via BroadcastChannel)
-        if (this.localChannel) {
-            this.localChannel.postMessage({ type: 'window-left', windowId: this.windowId });
-            this.localChannel.close();
-        }
-
-        // Remove ourselves from active windows
-        this.activeWindows.delete(this.windowId);
-
-        // State is not cleared here - it expires after 24 hours of inactivity via server TTL
-
-        this.storeSubscriber.apply();
-        this.echo.leave(this.channelName);
-    }
-
-    initializeEcho() {
+    /**
+     * Set up WebSocket channel for notifications
+     */
+    initializeChannel() {
         const reference = this.container.reference.replaceAll('::', '.');
         this.channelName = `${reference}.${this.container.site.replaceAll('.', '_')}`;
         this.channel = this.echo.join(this.channelName);
 
-        this.channel.here(async users => {
-            this.subscribeToVuexMutations();
+        // When we join, get list of users and announce ourselves
+        this.channel.here(users => {
             Statamic.$store.commit(`collaboration/${this.channelName}/setUsers`, users);
-
-            // Register our own window
-            this.activeWindows.add(this.windowId);
-
-            // Start inactivity timer
-            this.resetActivityTimer();
-
-            // Start warm-up period (always broadcast during this time)
-            this.warmUpPeriod = true;
-            setTimeout(() => {
-                this.warmUpPeriod = false;
-                this.debug('🔥 Warm-up period ended');
-            }, this.warmUpDurationMs);
-
-            // Always load cached state first (handles reconnects and stale data)
-            await this.loadCachedState('channel.here');
-
-            // Announce our window to others (they will respond with window-present and fresh state)
-            this.channel.whisper('window-joined', { windowId: this.windowId, user: this.user });
-        });
-
-        // Listen for other windows joining (use direct listener, no chunking needed)
-        this.channel.listenForWhisper('window-joined', ({ windowId, user }) => {
-            if (windowId === this.windowId) return;
-
-            this.debug(`Window joined: ${windowId}`, { user });
-            this.activeWindows.add(windowId);
-
-            // Respond so the new window knows about us
-            this.channel.whisper('window-present', { windowId: this.windowId, user: this.user });
-
-            // Send current state to the new window (cleaned meta to avoid component errors)
-            // The new window will get full data from server via loadCachedState
-            this.channel.whisper(`initialize-state-for-window-${windowId}`, {
-                values: Statamic.$store.state.publish[this.container.name].values,
-                meta: this.cleanEntireMetaPayload(Statamic.$store.state.publish[this.container.name].meta),
-                focus: Statamic.$store.state.collaboration[this.channelName].focus,
-                fromWindowId: this.windowId,
+            this.channel.whisper('window-joined', {
+                windowId: this.windowId,
+                user: this.user
             });
         });
 
-        // Listen for existing windows announcing themselves (use direct listener)
-        this.channel.listenForWhisper('window-present', ({ windowId, user }) => {
-            if (windowId === this.windowId) return;
-
-            this.debug(`Window present: ${windowId}`, { user });
-            this.activeWindows.add(windowId);
-        });
-
-        // Listen for windows leaving (use direct listener)
-        this.channel.listenForWhisper('window-left', ({ windowId }) => {
-            this.debug(`Window left: ${windowId}`);
-            this.activeWindows.delete(windowId);
-        });
-
-        // Listen for initial state from other windows (targeted to our windowId)
-        // This always merges state since other windows may have fresher data than cached state
-        this.channel.listenForWhisper(`initialize-state-for-window-${this.windowId}`, payload => {
-            // Don't apply if we have recent local changes (prevents overwriting our own edits)
-            const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-            if (timeSinceLastChange < this.localChangeProtectionMs) {
-                this.debug(`🛡️ Skipping initialize-state - local change was ${timeSinceLastChange}ms ago`);
-                return;
-            }
-
-            this.debug('✅ Applying/merging state from another window', payload);
-
-            // Mark that we're applying external data to prevent re-broadcasting
-            this.applyingBroadcast = true;
-            try {
-                // Merge values with current state
-                // Use commit instead of dispatch to avoid triggering autosave
-                const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                const mergedValues = { ...currentValues, ...payload.values };
-                Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
-
-                // Merge meta with current state
-                // Use commit instead of dispatch to avoid triggering autosave
-                const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
-                const restoredMeta = this.restoreEntireMetaPayload(payload.meta);
-                const mergedMeta = { ...currentMeta };
-                Object.keys(restoredMeta).forEach(handle => {
-                    mergedMeta[handle] = { ...currentMeta[handle], ...restoredMeta[handle] };
-                });
-                Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
-            } finally {
-                this.applyingBroadcast = false;
-            }
-
-            // Apply focus locks from other windows
-            _.each(payload.focus, ({ user, handle }) => {
-                if (user.id !== this.user.id) {
-                    this.focusAndLock(user, handle);
-                }
-            });
-
-            this.initialStateUpdated = true;
-        });
-
+        // User joined the channel
         this.channel.joining(user => {
             Statamic.$store.commit(`collaboration/${this.channelName}/addUser`, user);
-
-            // Only show toast and play sound for OTHER users (not our own other windows)
             if (user.id !== this.user.id) {
                 Statamic.$toast.info(`${user.name} has joined.`, { duration: 2000 });
-                if (Statamic.$config.get('collaboration.sound_effects')) {
-                    this.playAudio('buddy-in');
-                }
             }
-            // Note: State initialization is now handled via window-joined/window-present whispers
         });
 
+        // User left the channel
         this.channel.leaving(user => {
             Statamic.$store.commit(`collaboration/${this.channelName}/removeUser`, user);
-
-            // Only show toast and play sound for OTHER users (not our own other windows)
             if (user.id !== this.user.id) {
                 Statamic.$toast.info(`${user.name} has left.`, { duration: 2000 });
-                if (Statamic.$config.get('collaboration.sound_effects')) {
-                    this.playAudio('buddy-out');
-                }
             }
-
-            this.blurAndUnlock(user);
+            // Unlock any fields they had locked
+            this.unlockFieldsForUser(user);
         });
 
-        this.listenForWhisper('updated', e => {
-            this.applyBroadcastedValueChange(e);
-        });
-
-        // Handle large payloads - fetch from server instead of receiving via WebSocket
-        this.channel.listenForWhisper('fetch-field', ({ handle, type, windowId }) => {
-            this.debug(`📥 Received fetch-field from ${windowId?.slice(-6)}, my windowId: ${this.windowId?.slice(-6)}`);
-            if (windowId === this.windowId) {
-                this.debug(`📥 Skipping own fetch-field`);
-                return;
-            }
-
-            // Wait a bit for the sender's persist to complete before fetching
-            // (broadcast fires at 500ms, persist at 1000ms, so we wait 600ms to be safe)
-            this.debug(`📥 Will fetch ${type} for "${handle}" from server in 600ms`);
-            setTimeout(() => {
-                this.loadCachedState('fetch-field listener');
-            }, 600);
-        });
-
-        this.listenForWhisper('meta-updated', e => {
-            this.applyBroadcastedMetaChange(e);
-        });
-
-        this.listenForWhisper('focus', ({ user, handle, windowId }) => {
-            // Ignore focus events from our own other windows
+        // Listen for field change notifications
+        this.channel.listenForWhisper('field-changed', ({ windowId, handle }) => {
+            // Ignore our own notifications
             if (windowId === this.windowId) return;
 
-            this.debug(`Heard that user has changed focus`, { user, handle, windowId });
+            // Ignore if this field is locked by us
+            if (this.currentFocus === handle) return;
 
-            // Don't lock fields for our own other windows - only for other users
-            if (user.id === this.user.id) {
-                this.focus(user, handle);
-            } else {
-                this.focusAndLock(user, handle);
-                // Show toast that another user is editing this field
-                const fieldName = this.formatFieldName(handle);
-                // Statamic.$toast.info(`${fieldName} is being edited by ${user.name}.`, { duration: 2000 });
-            }
+            this.debug(`Field "${handle}" changed by another window, fetching...`);
+            this.fetchAndApplyField(handle);
         });
 
-        this.listenForWhisper('blur', ({ user, handle, windowId }) => {
-            // Ignore blur events from our own other windows
+        // Listen for focus events (field locking)
+        this.channel.listenForWhisper('focus', ({ windowId, user, handle }) => {
             if (windowId === this.windowId) return;
+            if (user.id === this.user.id) return; // Don't lock for our own other windows
 
-            this.debug(`Heard that user has blurred`, { user, handle, windowId });
-
-            // Don't unlock fields for our own other windows - only for other users
-            if (user.id === this.user.id) {
-                this.blur(user);
-            } else {
-                this.blurAndUnlock(user, handle);
-                // Show toast that another user finished editing
-                if (handle) {
-                    const fieldName = this.formatFieldName(handle);
-                    // Statamic.$toast.success(`${fieldName} is no longer being edited by ${user.name}.`, { duration: 2000 });
-                }
-            }
+            this.lockField(user, handle);
         });
 
-        this.listenForWhisper('force-unlock', ({ targetUser, originUser }) => {
-            this.debug(`Heard that user has requested another be unlocked`, { targetUser, originUser });
-
-            if (targetUser.id !== this.user.id) return;
-
-            document.activeElement.blur();
-            this.blurAndUnlock(this.user);
-            this.whisper('blur', { user: this.user });
-            Statamic.$toast.info(`${originUser.name} has unlocked your editor.`, { duration: false });
-        });
-
-        this.listenForWhisper('saved', ({ user, windowId }) => {
-            // Ignore if this is our own save action
+        // Listen for blur events (field unlocking after delay)
+        this.channel.listenForWhisper('blur', ({ windowId, user, handle }) => {
             if (windowId === this.windowId) return;
+            if (user.id === this.user.id) return;
 
-            // Update save status and original values since another window saved
-            const currentValues = Statamic.$store.state.publish[this.container.name].values;
-            Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
-            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
-
-            // Reset toast flags
-            this.unsavedToastShown = false;
-            this.notSavedToastShown = false;
-
-            Statamic.$toast.success(`Saved by ${user.name}.`);
+            // Unlock after 3 seconds
+            this.scheduleFieldUnlock(user, handle);
         });
 
-        this.listenForWhisper('published', ({ user, message, windowId }) => {
-            // Ignore if this is our own publish action
+        // Listen for save notifications
+        this.channel.listenForWhisper('saved', ({ windowId, user }) => {
             if (windowId === this.windowId) return;
+            Statamic.$toast.success(`Saved by ${user.name}.`, { duration: 2000 });
+            // Fetch all state after save
+            this.fetchAllState();
+        });
 
+        // Listen for publish notifications
+        this.channel.listenForWhisper('published', ({ windowId, user }) => {
+            if (windowId === this.windowId) return;
             Statamic.$toast.success(`Published by ${user.name}.`);
-            const messageProp = message
-                ? `Entry has been published by ${user.name} with the message: ${message}`
-                : `Entry has been published by ${user.name} with no message.`
             Statamic.$components.append('CollaborationBlockingNotification', {
-                props: { message: messageProp }
+                props: { message: `Entry has been published by ${user.name}. Please refresh.` }
             }).on('confirm', () => window.location.reload());
-            this.destroy(); // Stop listening to anything else.
-        });
-
-        this.listenForWhisper('revision-restored', ({ user, windowId }) => {
-            // Ignore if this is our own restore action
-            if (windowId === this.windowId) return;
-
-            Statamic.$toast.success(`Revision restored by ${user.name}.`);
-            Statamic.$components.append('CollaborationBlockingNotification', {
-                props: { message: `Entry has been restored to another revision by ${user.name}` }
-            }).on('confirm', () => window.location.reload());
-            this.destroy(); // Stop listening to anything else.
         });
     }
 
+    /**
+     * Set up Vuex store module for collaboration state
+     */
     initializeStore() {
-        // Detect if this is a new entry (not yet saved)
-        // New entries typically have 'create' in the reference or no valid ID
-        const isNewEntry = this.container.reference.includes('create') ||
-            !this.container.reference.match(/[a-f0-9-]{36}$/i);
-
         Statamic.$store.registerModule(['collaboration', this.channelName], {
             namespaced: true,
             state: {
                 users: [],
                 focus: {},
-                // Save status: 'notSaved' (new), 'saved' (no changes), 'changesNotSaved' (has changes)
-                saveStatus: isNewEntry ? 'notSaved' : 'saved',
-                // Store original values to detect changes
-                originalValues: null,
             },
             mutations: {
                 setUsers(state, users) {
@@ -497,643 +222,235 @@ export default class Workspace {
                 addUser(state, user) {
                     state.users.push(user);
                 },
-                removeUser(state, removedUser) {
-                    state.users = state.users.filter(user => user.id !== removedUser.id);
+                removeUser(state, user) {
+                    state.users = state.users.filter(u => u.id !== user.id);
                 },
-                focus(state, { handle, user }) {
-                    Vue.set(state.focus, user.id, { handle, user });
+                setFocus(state, { user, handle }) {
+                    Vue.set(state.focus, user.id, { user, handle });
                 },
-                blur(state, user) {
+                clearFocus(state, user) {
                     Vue.delete(state.focus, user.id);
-                },
-                setSaveStatus(state, status) {
-                    state.saveStatus = status;
-                },
-                setOriginalValues(state, values) {
-                    state.originalValues = values;
                 }
             }
         });
-    }
 
-    initializeStatusBar() {
-        const component = this.container.pushComponent('CollaborationStatusBar', {
-            props: {
-                channelName: this.channelName,
+        // Subscribe to Vuex mutations to detect field changes
+        this.storeSubscriber = Statamic.$store.subscribe((mutation) => {
+            if (this.applyingRemoteChange) return;
+
+            if (mutation.type === `publish/${this.container.name}/setFieldValue`) {
+                this.onFieldValueChanged(mutation.payload);
+            }
+            if (mutation.type === `publish/${this.container.name}/setFieldMeta`) {
+                this.onFieldMetaChanged(mutation.payload);
             }
         });
 
-        component.on('unlock', (targetUser) => {
-            this.whisper('force-unlock', { targetUser, originUser: this.user });
+        // Store initial values for change detection
+        this.lastValues = clone(Statamic.$store.state.publish[this.container.name].values);
+        this.lastMeta = clone(Statamic.$store.state.publish[this.container.name].meta);
+    }
+
+    /**
+     * Set up focus/blur tracking for fields
+     */
+    initializeFocus() {
+        this.container.$on('focus', handle => {
+            this.currentFocus = handle;
+            this.channel.whisper('focus', {
+                windowId: this.windowId,
+                user: this.user,
+                handle
+            });
+            Statamic.$store.commit(`collaboration/${this.channelName}/setFocus`, {
+                user: this.user,
+                handle
+            });
+        });
+
+        this.container.$on('blur', handle => {
+            this.currentFocus = null;
+            this.channel.whisper('blur', {
+                windowId: this.windowId,
+                user: this.user,
+                handle
+            });
+            Statamic.$store.commit(`collaboration/${this.channelName}/clearFocus`, this.user);
+
+            // Sync changes when leaving a field
+            this.syncChangedFields();
         });
     }
 
+    /**
+     * Set up hooks for save/publish events
+     */
     initializeHooks() {
         Statamic.$hooks.on('entry.saved', (resolve, reject, { reference }) => {
             if (reference === this.container.reference) {
-                // Update save status to 'saved' and store new original values
-                const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
-                Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
-
-                // Reset toast flags
-                this.unsavedToastShown = false;
-                this.notSavedToastShown = false;
-
-                // Clear cached state from server
-                this.clearCachedState();
-
-                // Force whisper to notify all windows (including own other windows)
-                this.whisper('saved', { user: this.user, windowId: this.windowId }, { force: true });
+                // Clear server cache and notify others
+                this.clearServerState();
+                this.channel.whisper('saved', {
+                    windowId: this.windowId,
+                    user: this.user
+                });
             }
             resolve();
         });
 
-        Statamic.$hooks.on('entry.published', (resolve, reject, { reference, message }) => {
+        Statamic.$hooks.on('entry.published', (resolve, reject, { reference }) => {
             if (reference === this.container.reference) {
-                // Force whisper to notify all windows (including own other windows)
-                this.whisper('published', { user: this.user, message, windowId: this.windowId }, { force: true });
+                this.channel.whisper('published', {
+                    windowId: this.windowId,
+                    user: this.user
+                });
             }
             resolve();
         });
+    }
 
-        Statamic.$hooks.on('revision.restored', (resolve, reject, { reference }) => {
-            if (reference !== this.container.reference) return resolve();
-
-            // Force whisper to notify all windows (including own other windows)
-            this.whisper('revision-restored', { user: this.user, windowId: this.windowId }, { force: true });
-
-            // Echo doesn't give us a promise, so wait half a second before resolving.
-            // That should be enough time for the whisper to be sent before the the page refreshes.
-            setTimeout(resolve, 500);
+    /**
+     * Add collaboration status bar to the publish form
+     */
+    initializeStatusBar() {
+        const component = this.container.pushComponent('CollaborationStatusBar', {
+            props: { channelName: this.channelName }
         });
-    }
 
-    initializeFocus() {
-        this.container.$on('focus', handle => {
-            const user = this.user;
-            this.focus(user, handle);
-            this.whisper('focus', { user, handle, windowId: this.windowId });
-        });
-        this.container.$on('blur', handle => {
-            const user = this.user;
-            this.blur(user, handle);
-            this.whisper('blur', { user, handle, windowId: this.windowId });
-        });
-    }
-
-    focus(user, handle) {
-        Statamic.$store.commit(`collaboration/${this.channelName}/focus`, { user, handle });
-    }
-
-    focusAndLock(user, handle) {
-        this.focus(user, handle);
-        Statamic.$store.commit(`publish/${this.container.name}/lockField`, { user, handle });
-    }
-
-    blur(user) {
-        Statamic.$store.commit(`collaboration/${this.channelName}/blur`, user);
-    }
-
-    blurAndUnlock(user, handle = null) {
-        handle = handle || data_get(Statamic.$store.state.collaboration[this.channelName], `focus.${user.id}.handle`);
-        if (!handle) return;
-        this.blur(user);
-        Statamic.$store.commit(`publish/${this.container.name}/unlockField`, handle);
-    }
-
-    subscribeToVuexMutations() {
-        this.storeSubscriber = Statamic.$store.subscribe((mutation, state) => {
-            switch (mutation.type) {
-                case `publish/${this.container.name}/setFieldValue`:
-                    this.vuexFieldValueHasBeenSet(mutation.payload);
-                    break;
-                case `publish/${this.container.name}/setFieldMeta`:
-                    this.vuexFieldMetaHasBeenSet(mutation.payload);
-                    break;
-            }
-        });
-    }
-
-    // A field's value has been set in the vuex store.
-    // It could have been triggered by the current user editing something,
-    // or by the workspace applying a change dispatched by another user editing something.
-    vuexFieldValueHasBeenSet(payload) {
-        const valuePreview = typeof payload.value === 'string'
-            ? payload.value.slice(-50)
-            : JSON.stringify(payload.value).slice(-50);
-        this.debug('Vuex field value has been set', {
-            handle: payload.handle,
-            user: payload.user,
-            applyingBroadcast: this.applyingBroadcast,
-            valueEnd: valuePreview
-        });
-        if (!this.hasChanged('value', payload.handle, payload.value)) {
-            // No change? Don't bother doing anything.
-            this.debug(`Value for ${payload.handle} has not changed.`);
-            return;
-        }
-
-        this.rememberChange('value', payload.handle, payload.value);
-
-        // Update save status based on whether values differ from original
-        this.updateSaveStatus();
-
-        // Reset inactivity timer on any change
-        this.resetActivityTimer();
-
-        // Only broadcast and persist if this change originated from THIS window
-        if (!this.applyingBroadcast) {
-            // Track when we made this local change
-            this.lastLocalChangeTime = Date.now();
-            this.debug(`📤 Will broadcast change for ${payload.handle}`);
-            this.debouncedBroadcastValueChangeFuncByHandle(payload.handle)(payload);
-
-            // Persist to server cache (only for our own changes from this window)
-            if (this.user.id == payload.user) {
-                this.persistValueChange(payload.handle, payload.value);
-            }
-        } else {
-            this.debug(`🚫 Not broadcasting - applyingBroadcast is true`);
-        }
-    }
-
-    // A field's meta value has been set in the vuex store.
-    // It could have been triggered by the current user editing something,
-    // or by the workspace applying a change dispatched by another user editing something.
-    vuexFieldMetaHasBeenSet(payload) {
-        this.debug('Vuex field meta has been set', payload);
-        if (!this.hasChanged('meta', payload.handle, payload.value)) {
-            // No change? Don't bother doing anything.
-            this.debug(`Meta for ${payload.handle} has not changed.`, { value: payload.value, lastValue: this.lastMetaValues[payload.handle] });
-            return;
-        }
-
-        this.rememberChange('meta', payload.handle, payload.value);
-
-        // Reset inactivity timer on any change
-        this.resetActivityTimer();
-
-        // Only broadcast and persist if this change originated from THIS window
-        if (!this.applyingBroadcast) {
-            this.debouncedBroadcastMetaChangeFuncByHandle(payload.handle)(payload);
-
-            // Persist to server cache (only for our own changes from this window)
-            if (this.user.id == payload.user) {
-                this.persistMetaChange(payload.handle, payload.value);
-            }
-        }
-    }
-
-    rememberChange(type, handle, value) {
-        this.debug(`Remembering ${type} change`, { handle, value });
-        const cache = type === 'value' ? this.lastValues : this.lastMetaValues;
-        cache[handle] = clone(value);
-    }
-
-    getOrCreateDebouncedFunc(cache, handle, callback, delay) {
-        if (!cache[handle]) {
-            cache[handle] = _.debounce(callback, delay);
-        }
-        return cache[handle];
-    }
-
-    debouncedBroadcastValueChangeFuncByHandle(handle) {
-        return this.getOrCreateDebouncedFunc(
-            this.debouncedBroadcastValueChangeFuncsByHandle, handle,
-            (payload) => this.broadcastValueChange(payload), 500
-        );
-    }
-
-    debouncedBroadcastMetaChangeFuncByHandle(handle) {
-        return this.getOrCreateDebouncedFunc(
-            this.debouncedBroadcastMetaChangeFuncsByHandle, handle,
-            (payload) => this.broadcastMetaChange(payload), 500
-        );
-    }
-
-    hasChanged(type, handle, newValue) {
-        const cache = type === 'value' ? this.lastValues : this.lastMetaValues;
-        const lastValue = cache[handle] || null;
-        return JSON.stringify(lastValue) !== JSON.stringify(newValue);
-    }
-
-    updateSaveStatus() {
-        const state = Statamic.$store.state.collaboration[this.channelName];
-        const currentStatus = state.saveStatus;
-
-        // If it's a new entry that was never saved, show toast once
-        if (currentStatus === 'notSaved' && !this.notSavedToastShown) {
-            this.notSavedToastShown = true;
-            Statamic.$toast.info('New entry — changes stored temporarily for 12 hours.');
-            return;
-        }
-
-        // Compare current values with original values
-        const currentValues = Statamic.$store.state.publish[this.container.name].values;
-        const originalValues = state.originalValues;
-
-        if (!originalValues) {
-            return;
-        }
-
-        const hasChanges = JSON.stringify(currentValues) !== JSON.stringify(originalValues);
-
-        if (hasChanges && currentStatus !== 'changesNotSaved') {
-            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'changesNotSaved');
-            this.debug('📝 Save status changed to: changesNotSaved');
-            // Show toast for unsaved changes (only once per "dirty" state)
-            if (!this.unsavedToastShown) {
-                this.unsavedToastShown = true;
-                Statamic.$toast.info('Unsaved changes — stored temporarily for 12 hours.');
-            }
-        } else if (!hasChanges && currentStatus !== 'saved') {
-            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
-            this.debug('📝 Save status changed to: saved');
-            // Reset toast flag so it can show again next time
-            this.unsavedToastShown = false;
-        }
-    }
-
-    async broadcastValueChange(payload) {
-        // Only broadcast if this change originated from THIS window (not from a broadcast we received)
-        if (this.applyingBroadcast) {
-            this.debug(`🚫 Skipping broadcast - applyingBroadcast is true`);
-            return { largePayload: false };
-        }
-
-        // Only my own change events should be broadcasted
-        if (this.user.id == payload.user) {
-            const fullPayload = { ...payload, windowId: this.windowId };
-
-            // For large payloads (>3KB), persist immediately and notify others to fetch from server
-            if (JSON.stringify(fullPayload).length > 3000) {
-                this.debug(`📦 Large payload for "${payload.handle}", persisting and sending fetch notification`);
-                // Wait for persist to complete before notifying others to fetch
-                await this.sendStateUpdate(payload.handle, payload.value, 'value');
-                this.channel.whisper('fetch-field', { handle: payload.handle, type: 'value', windowId: this.windowId });
-                return { largePayload: true }; // Signal that we already persisted
-            } else {
-                this.whisper('updated', fullPayload);
-            }
-        }
-        return { largePayload: false };
-    }
-
-    async broadcastMetaChange(payload) {
-        // Only broadcast if this change originated from THIS window (not from a broadcast we received)
-        if (this.applyingBroadcast) return;
-
-        // Only my own change events should be broadcasted
-        if (this.user.id == payload.user) {
-            // Clone payload to avoid mutating the original (persist needs full data)
-            const payloadClone = { ...payload, value: clone(payload.value) };
-            const cleanedPayload = { ...this.cleanMetaPayload(payloadClone), windowId: this.windowId };
-
-            // For large payloads (>3KB), persist immediately and notify others to fetch from server
-            if (JSON.stringify(cleanedPayload).length > 3000) {
-                this.debug(`📦 Large meta payload for "${payload.handle}", persisting and sending fetch notification`);
-                // Wait for persist to complete before notifying others to fetch
-                await this.sendStateUpdate(payload.handle, payload.value, 'meta');
-                this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
-            } else {
-                this.whisper('meta-updated', cleanedPayload);
-            }
-        }
-    }
-
-    // Allow fieldtypes to provide an array of keys that will be broadcasted.
-    // For example, in Bard, only the "existing" value in its meta object
-    // ever gets updated. We'll just broadcast that, rather than the
-    // whole thing, which would be wasted bytes in the message.
-    cleanMetaPayload(payload) {
-        const allowed = data_get(payload, 'value.__collaboration');
-        if (!allowed) return payload;
-        let allowedValues = {};
-        allowed.forEach(key => allowedValues[key] = payload.value[key]);
-        payload.value = allowedValues;
-        return payload;
-    }
-
-    // Similar to cleanMetaPayload, except for when dealing with the
-    // entire list of fields' meta values. Used when a user joins
-    // and needs to receive everything in one fell swoop.
-    cleanEntireMetaPayload(values) {
-        return _.mapObject(values, meta => {
-            const allowed = data_get(meta, '__collaboration');
-            if (!allowed) return meta;
-            let allowedValues = {};
-            allowed.forEach(key => allowedValues[key] = meta[key]);
-            return allowedValues;
-        });
-    }
-
-    restoreEntireMetaPayload(payload) {
-        return _.mapObject(payload, (value, key) => {
-            return { ...this.lastMetaValues[key], ...value };
-        });
-    }
-
-    formatFieldName(handle) {
-        if (!handle) return 'Field';
-        // Convert handle like "my_field_name" or "myFieldName" to "My field name"
-        return handle
-            .replace(/_/g, ' ')
-            .replace(/([a-z])([A-Z])/g, '$1 $2')
-            .replace(/^./, str => str.toUpperCase());
-    }
-
-    async applyBroadcastedValueChange(payload) {
-        // Ignore broadcasts from this same window
-        if (payload.windowId === this.windowId) return;
-
-        // Don't overwrite if user has made recent local changes (protects against losing typing)
-        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-        if (timeSinceLastChange < this.localChangeProtectionMs) {
-            this.debug(`🛡️ Skipping value change - local change was ${timeSinceLastChange}ms ago`);
-            return;
-        }
-
-        // Skip if value is undefined or null (prevents component errors)
-        if (payload.value === undefined || payload.value === null) {
-            this.debug(`🛡️ Skipping value change - value is ${payload.value}`);
-            return;
-        }
-
-        this.debug('✅ Applying broadcasted value change', payload);
-
-        // Track this field as recently updated via broadcast (to protect from stale server data)
-        this.recentBroadcastUpdates[payload.handle] = Date.now();
-
-        // Mark that we're applying a broadcast to prevent re-broadcasting
-        this.applyingBroadcast = true;
-        try {
-            // Use commit instead of dispatch to avoid triggering autosave side effects
-            Statamic.$store.commit(`publish/${this.container.name}/setFieldValue`, payload);
-        } finally {
-            this.applyingBroadcast = false;
-        }
-    }
-
-    async applyBroadcastedMetaChange(payload) {
-        // Ignore broadcasts from this same window
-        if (payload.windowId === this.windowId) return;
-
-        // Don't overwrite if user has made recent local changes (protects against losing typing)
-        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-        if (timeSinceLastChange < this.localChangeProtectionMs) {
-            this.debug(`🛡️ Skipping meta change - local change was ${timeSinceLastChange}ms ago`);
-            return;
-        }
-
-        // Skip if value is undefined or null (prevents component errors)
-        if (payload.value === undefined || payload.value === null) {
-            this.debug(`🛡️ Skipping meta change - value is ${payload.value}`);
-            return;
-        }
-
-        this.debug('✅ Applying broadcasted meta change', payload);
-
-        // Track this field as recently updated via broadcast (to protect from stale server data)
-        this.recentBroadcastUpdates[payload.handle] = Date.now();
-
-        let value = { ...this.lastMetaValues[payload.handle], ...payload.value };
-        payload.value = value;
-
-        // Mark that we're applying a broadcast to prevent re-broadcasting
-        this.applyingBroadcast = true;
-        try {
-            // Use commit instead of dispatch to avoid triggering autosave side effects
-            Statamic.$store.commit(`publish/${this.container.name}/setFieldMeta`, payload);
-        } finally {
-            this.applyingBroadcast = false;
-        }
-    }
-
-    debug(message, args) {
-        if (!Statamic.$config.get('collaboration.debug')) return;
-        console.log(`[Collaboration ${this.windowId?.slice(-6) || 'init'}]`, message, { ...args });
-    }
-
-    isAlone() {
-        // During warm-up period, assume we're not alone (ensures sync works while windows are joining)
-        if (this.warmUpPeriod) {
-            this.debug('isAlone check: in warm-up period, returning false');
-            return false;
-        }
-
-        // Check multiple sources for other windows/users
-        const users = Statamic.$store.state.collaboration[this.channelName]?.users || [];
-        const multipleUsers = users.length > 1;
-        const multipleRemoteWindows = this.activeWindows.size > 1;
-        const multipleLocalWindows = this.localWindows.size > 0; // Other local windows in same browser
-
-        // Not alone if multiple users OR multiple remote windows OR other local windows
-        const alone = !multipleUsers && !multipleRemoteWindows && !multipleLocalWindows;
-
-        this.debug(`isAlone check: users=${users.length}, remoteWindows=${this.activeWindows.size}, localWindows=${this.localWindows.size}, alone=${alone}`);
-        return alone;
-    }
-
-    whisper(event, payload, { force = false } = {}) {
-        // Skip if alone, unless forced (for save/publish notifications to own windows)
-        if (!force && this.isAlone()) return;
-
-        const chunkSize = 2500;
-        const str = JSON.stringify(payload);
-        const msgId = Math.random() + '';
-
-        if (str.length < chunkSize) {
-            this.debug(`📣 Broadcasting "${event}"`, payload);
-            this.channel.whisper(event, payload);
-            return;
-        }
-
-        event = `chunked-${event}`;
-
-        for (let i = 0; i * chunkSize < str.length; i++) {
-            const chunk = {
-                id: msgId,
-                index: i,
-                chunk: str.slice(i * chunkSize, (i + 1) * chunkSize),
-                final: chunkSize * (i + 1) >= str.length
-            };
-            this.debug(`📣 Broadcasting "${event}"`, chunk);
-            this.channel.whisper(event, chunk);
-        }
-    }
-
-    listenForWhisper(event, callback) {
-        this.channel.listenForWhisper(event, callback);
-
-        let events = {};
-        this.channel.listenForWhisper(`chunked-${event}`, data => {
-            if (!events.hasOwnProperty(data.id)) {
-                events[data.id] = { chunks: [], receivedFinal: false };
-            }
-
-            let e = events[data.id];
-            e.chunks[data.index] = data.chunk;
-            if (data.final) e.receivedFinal = true;
-            if (e.receivedFinal && e.chunks.length === Object.keys(e.chunks).length) {
-                callback(JSON.parse(e.chunks.join('')));
-                delete events[data.id];
-            }
-        });
-    }
-
-    playAudio(file) {
-        const audioFiles = { 'buddy-in': buddyIn, 'buddy-out': buddyOut };
-        const el = document.createElement('audio');
-        el.src = audioFiles[file];
-        el.volume = 0.25;
-        el.addEventListener('ended', () => el.remove());
-        document.body.appendChild(el);
-        el.play();
-    }
-
-    initializeValuesAndMeta() {
-        this.lastValues = clone(Statamic.$store.state.publish[this.container.name].values);
-        this.lastMetaValues = clone(Statamic.$store.state.publish[this.container.name].meta);
-
-        // Store original values to detect changes later
-        Statamic.$store.commit(
-            `collaboration/${this.channelName}/setOriginalValues`,
-            clone(this.lastValues)
-        );
-    }
-
-    cancelPendingBroadcasts() {
-        // Cancel all pending debounced broadcast functions
-        Object.values(this.debouncedBroadcastValueChangeFuncsByHandle).forEach(func => {
-            if (func && typeof func.cancel === 'function') {
-                func.cancel();
-            }
-        });
-        Object.values(this.debouncedBroadcastMetaChangeFuncsByHandle).forEach(func => {
-            if (func && typeof func.cancel === 'function') {
-                func.cancel();
-            }
-        });
-        this.debug('🚫 Cancelled pending debounced broadcasts');
-    }
-
-    async loadCachedState(source = 'unknown') {
-        // Prevent concurrent loadCachedState calls
-        if (this.loadingCachedState) {
-            this.debug(`🔄 loadCachedState already in progress, skipping call from: ${source}`);
-            return;
-        }
-
-        // Don't overwrite if user has made recent local changes (protects against losing typing)
-        // This applies to all sources now, not just fetch-field listener
-        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-        if (timeSinceLastChange < this.localChangeProtectionMs) {
-            this.debug(`🛡️ Skipping loadCachedState (${source}) - local change was ${timeSinceLastChange}ms ago (protection: ${this.localChangeProtectionMs}ms)`);
-            return;
-        }
-
-        this.loadingCachedState = true;
-        this.debug(`🔄 loadCachedState called from: ${source}`);
-
-        // Cancel any pending debounced broadcasts to prevent them from firing during fetch
-        this.cancelPendingBroadcasts();
-
-        // Set applyingBroadcast BEFORE fetch to prevent any broadcasts during the entire operation
-        this.debug('🔒 Setting applyingBroadcast = true (before fetch)');
-        this.applyingBroadcast = true;
-
-        try {
-            const response = await fetch(this.stateApiUrl, {
-                headers: {
-                    'Accept': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest',
-                },
-                credentials: 'same-origin',
+        component.on('unlock', (targetUser) => {
+            this.channel.whisper('force-unlock', {
+                targetUser,
+                originUser: this.user
             });
+        });
+    }
 
-            if (!response.ok) return;
+    /**
+     * Load any existing state from server on startup
+     */
+    async loadInitialState() {
+        await this.fetchAllState();
+    }
 
-            const data = await response.json();
+    // =========================================================================
+    // CHANGE DETECTION & SYNC
+    // =========================================================================
 
-            if (!data.exists) {
-                this.debug('No cached state found');
-                return;
-            }
+    /**
+     * Called when a field value changes in Vuex
+     */
+    onFieldValueChanged(payload) {
+        const { handle, value } = payload;
 
-            this.debug('✅ Applying cached state from server', data);
+        // Check if value actually changed
+        if (JSON.stringify(this.lastValues[handle]) === JSON.stringify(value)) {
+            return;
+        }
 
-            // Apply cached values - merge with current values
-            // Skip fields that were recently updated via broadcast (server may have stale data)
-            // Use commit instead of dispatch to avoid triggering autosave
-            if (data.values && Object.keys(data.values).length > 0) {
-                const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                const mergedValues = { ...currentValues };
+        this.lastValues[handle] = clone(value);
+        this.debug(`Field "${handle}" value changed`);
 
-                Object.keys(data.values).forEach(handle => {
-                    const recentUpdate = this.recentBroadcastUpdates[handle];
-                    if (recentUpdate && (Date.now() - recentUpdate) < this.localChangeProtectionMs) {
-                        this.debug(`🛡️ Skipping server value for "${handle}" - recently updated via broadcast`);
-                    } else {
-                        mergedValues[handle] = data.values[handle];
-                    }
-                });
+        // Reset inactivity timer
+        this.resetInactivityTimer();
+    }
 
-                this.debug('📝 Committing setValues...');
-                Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
-                this.debug('📝 setValues commit completed');
-            }
+    /**
+     * Called when field meta changes in Vuex
+     */
+    onFieldMetaChanged(payload) {
+        const { handle, value } = payload;
 
-            // Apply cached meta - merge with current meta
-            // Skip fields that were recently updated via broadcast
-            // Use commit instead of dispatch to avoid triggering autosave
-            if (data.meta && Object.keys(data.meta).length > 0) {
-                const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
-                const mergedMeta = { ...currentMeta };
-                Object.keys(data.meta).forEach(handle => {
-                    const recentUpdate = this.recentBroadcastUpdates[handle];
-                    if (recentUpdate && (Date.now() - recentUpdate) < this.localChangeProtectionMs) {
-                        this.debug(`🛡️ Skipping server meta for "${handle}" - recently updated via broadcast`);
-                    } else {
-                        mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
-                    }
-                });
-                Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
-            }
+        // Check if meta actually changed
+        if (JSON.stringify(this.lastMeta[handle]) === JSON.stringify(value)) {
+            return;
+        }
 
-            this.initialStateUpdated = true;
-        } catch (error) {
-            this.debug('Failed to load cached state', { error });
-        } finally {
-            this.debug('🔓 Setting applyingBroadcast = false');
-            this.applyingBroadcast = false;
-            this.loadingCachedState = false;
+        this.lastMeta[handle] = clone(value);
+        this.debug(`Field "${handle}" meta changed`);
+
+        // Reset inactivity timer
+        this.resetInactivityTimer();
+    }
+
+    /**
+     * Reset the inactivity timer (syncs after 5 seconds of no changes)
+     */
+    resetInactivityTimer() {
+        this.clearInactivityTimer();
+        this.inactivityTimer = setTimeout(() => {
+            this.syncChangedFields();
+        }, this.inactivityDelayMs);
+    }
+
+    /**
+     * Clear the inactivity timer
+     */
+    clearInactivityTimer() {
+        if (this.inactivityTimer) {
+            clearTimeout(this.inactivityTimer);
+            this.inactivityTimer = null;
         }
     }
 
-    persistValueChange(handle, value) {
-        this.debouncedPersistValueFuncByHandle(handle)({ handle, value });
+    /**
+     * Sync all changed fields to server and notify others
+     */
+    async syncChangedFields() {
+        this.clearInactivityTimer();
+
+        const currentValues = Statamic.$store.state.publish[this.container.name].values;
+        const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
+
+        // Find changed values
+        const changedHandles = new Set();
+
+        for (const handle of Object.keys(currentValues)) {
+            if (JSON.stringify(currentValues[handle]) !== JSON.stringify(this.lastValues[handle])) {
+                changedHandles.add(handle);
+            }
+        }
+
+        for (const handle of Object.keys(currentMeta)) {
+            if (JSON.stringify(currentMeta[handle]) !== JSON.stringify(this.lastMeta[handle])) {
+                changedHandles.add(handle);
+            }
+        }
+
+        if (changedHandles.size === 0) {
+            return;
+        }
+
+        this.debug(`Syncing ${changedHandles.size} changed field(s)...`);
+
+        // Persist each changed field to server
+        for (const handle of changedHandles) {
+            if (currentValues[handle] !== undefined) {
+                await this.persistField(handle, currentValues[handle], 'value');
+            }
+            if (currentMeta[handle] !== undefined) {
+                await this.persistField(handle, currentMeta[handle], 'meta');
+            }
+
+            // Notify others to fetch this field
+            this.channel.whisper('field-changed', {
+                windowId: this.windowId,
+                handle
+            });
+        }
+
+        // Update our tracking
+        this.lastValues = clone(currentValues);
+        this.lastMeta = clone(currentMeta);
     }
 
-    persistMetaChange(handle, value) {
-        this.debouncedPersistMetaFuncByHandle(handle)({ handle, value });
-    }
+    // =========================================================================
+    // SERVER COMMUNICATION
+    // =========================================================================
 
-    debouncedPersistValueFuncByHandle(handle) {
-        return this.getOrCreateDebouncedFunc(
-            this.debouncedPersistValueFuncsByHandle, handle,
-            (payload) => this.sendStateUpdate(payload.handle, payload.value, 'value'), 1000
-        );
-    }
-
-    debouncedPersistMetaFuncByHandle(handle) {
-        return this.getOrCreateDebouncedFunc(
-            this.debouncedPersistMetaFuncsByHandle, handle,
-            (payload) => this.sendStateUpdate(payload.handle, payload.value, 'meta'), 1000
-        );
-    }
-
-    async sendStateUpdate(handle, value, type) {
+    /**
+     * Persist a single field to the server
+     */
+    async persistField(handle, value, type) {
         try {
             const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
                 || Statamic.$config.get('csrfToken');
@@ -1150,13 +467,113 @@ export default class Workspace {
                 body: JSON.stringify({ handle, value, type }),
             });
 
-            this.debug(`📦 Persisted ${type} change for "${handle}" to server`);
+            this.debug(`Persisted ${type} for "${handle}"`);
         } catch (error) {
-            this.debug(`Failed to persist ${type} change`, { error });
+            this.debug(`Failed to persist ${type} for "${handle}"`, error);
         }
     }
 
-    async clearCachedState() {
+    /**
+     * Fetch all state from server and apply it
+     */
+    async fetchAllState() {
+        try {
+            const response = await fetch(this.stateApiUrl, {
+                headers: {
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                credentials: 'same-origin',
+            });
+
+            if (!response.ok) return;
+
+            const data = await response.json();
+            if (!data.exists) return;
+
+            this.applyState(data.values, data.meta);
+        } catch (error) {
+            this.debug('Failed to fetch state', error);
+        }
+    }
+
+    /**
+     * Fetch a specific field from server and apply it
+     */
+    async fetchAndApplyField(handle) {
+        try {
+            const response = await fetch(this.stateApiUrl, {
+                headers: {
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                credentials: 'same-origin',
+            });
+
+            if (!response.ok) return;
+
+            const data = await response.json();
+            if (!data.exists) return;
+
+            // Apply only the specific field
+            const values = data.values?.[handle] !== undefined ? { [handle]: data.values[handle] } : null;
+            const meta = data.meta?.[handle] !== undefined ? { [handle]: data.meta[handle] } : null;
+
+            this.applyState(values, meta);
+        } catch (error) {
+            this.debug(`Failed to fetch field "${handle}"`, error);
+        }
+    }
+
+    /**
+     * Apply state from server to Vuex store
+     */
+    applyState(values, meta) {
+        this.applyingRemoteChange = true;
+
+        try {
+            if (values && Object.keys(values).length > 0) {
+                const currentValues = Statamic.$store.state.publish[this.container.name].values;
+                const mergedValues = { ...currentValues };
+
+                for (const handle of Object.keys(values)) {
+                    // Skip if this field is currently being edited by us
+                    if (this.currentFocus === handle) {
+                        this.debug(`Skipping "${handle}" - currently editing`);
+                        continue;
+                    }
+                    mergedValues[handle] = values[handle];
+                    this.lastValues[handle] = clone(values[handle]);
+                }
+
+                Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
+            }
+
+            if (meta && Object.keys(meta).length > 0) {
+                const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
+                const mergedMeta = { ...currentMeta };
+
+                for (const handle of Object.keys(meta)) {
+                    // Skip if this field is currently being edited by us
+                    if (this.currentFocus === handle) {
+                        this.debug(`Skipping meta for "${handle}" - currently editing`);
+                        continue;
+                    }
+                    mergedMeta[handle] = { ...currentMeta[handle], ...meta[handle] };
+                    this.lastMeta[handle] = clone(mergedMeta[handle]);
+                }
+
+                Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
+            }
+        } finally {
+            this.applyingRemoteChange = false;
+        }
+    }
+
+    /**
+     * Clear all cached state from server (called on save)
+     */
+    async clearServerState() {
         try {
             const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
                 || Statamic.$config.get('csrfToken');
@@ -1171,52 +588,84 @@ export default class Workspace {
                 credentials: 'same-origin',
             });
 
-            this.debug('🗑️ Cleared cached state from server');
+            this.debug('Cleared server state');
         } catch (error) {
-            this.debug('Failed to clear cached state', { error });
+            this.debug('Failed to clear server state', error);
         }
     }
 
-    resetActivityTimer() {
-        // Clear existing timer
-        if (this.inactivityTimer) {
-            clearTimeout(this.inactivityTimer);
-        }
+    // =========================================================================
+    // FIELD LOCKING
+    // =========================================================================
 
-        // Reset warning state
-        this.inactivityWarningShown = false;
-
-        // Start new timer
-        this.inactivityTimer = setTimeout(() => {
-            this.showInactivityWarning();
-        }, this.inactivityTimeout);
-
-        this.debug('Activity timer reset');
+    /**
+     * Lock a field (another user is editing it)
+     */
+    lockField(user, handle) {
+        this.lockedFields[handle] = user;
+        Statamic.$store.commit(`publish/${this.container.name}/lockField`, { user, handle });
+        Statamic.$store.commit(`collaboration/${this.channelName}/setFocus`, { user, handle });
+        this.debug(`Field "${handle}" locked by ${user.name}`);
     }
 
-    clearActivityTimer() {
-        if (this.inactivityTimer) {
-            clearTimeout(this.inactivityTimer);
-            this.inactivityTimer = null;
+    /**
+     * Schedule a field to be unlocked after 3 seconds
+     */
+    scheduleFieldUnlock(user, handle) {
+        // Clear any existing timer for this field
+        if (this.fieldLockTimers[handle]) {
+            clearTimeout(this.fieldLockTimers[handle]);
         }
+
+        this.fieldLockTimers[handle] = setTimeout(() => {
+            this.unlockField(user, handle);
+            delete this.fieldLockTimers[handle];
+        }, this.fieldLockDurationMs);
     }
 
-    showInactivityWarning() {
-        if (this.inactivityWarningShown) return;
+    /**
+     * Unlock a field
+     */
+    unlockField(user, handle) {
+        delete this.lockedFields[handle];
+        Statamic.$store.commit(`publish/${this.container.name}/unlockField`, handle);
+        Statamic.$store.commit(`collaboration/${this.channelName}/clearFocus`, user);
+        this.debug(`Field "${handle}" unlocked`);
+    }
 
-        this.inactivityWarningShown = true;
-
-        Statamic.$components.append('CollaborationBlockingNotification', {
-            props: {
-                title: 'Inactivity Warning',
-                message: 'There has been no activity for 12 hours. Please close this content to avoid conflicts.',
-                confirmText: 'Close'
+    /**
+     * Unlock all fields for a user (when they leave)
+     */
+    unlockFieldsForUser(user) {
+        for (const [handle, lockedUser] of Object.entries(this.lockedFields)) {
+            if (lockedUser.id === user.id) {
+                this.unlockField(user, handle);
             }
-        }).on('confirm', () => {
-            // Navigate away or close
-            window.location.href = Statamic.$config.get('cpUrl') || '/cp';
-        });
-
-        this.debug('⚠️ Inactivity warning shown after 12 hours');
+        }
     }
+
+    // =========================================================================
+    // UTILITIES
+    // =========================================================================
+
+    /**
+     * Debug logging (only when enabled in config)
+     */
+    debug(message, data = null) {
+        if (!Statamic.$config.get('collaboration.debug')) return;
+        const prefix = `[Collab ${this.windowId.slice(-6)}]`;
+        if (data) {
+            console.log(prefix, message, data);
+        } else {
+            console.log(prefix, message);
+        }
+    }
+}
+
+/**
+ * Deep clone helper
+ */
+function clone(obj) {
+    if (obj === null || obj === undefined) return obj;
+    return JSON.parse(JSON.stringify(obj));
 }
