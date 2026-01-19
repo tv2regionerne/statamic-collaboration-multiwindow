@@ -36,8 +36,11 @@ export default {
     },
 
     computed: {
+        collaborationState() {
+            return this.$store.state.collaboration?.[this.channelName];
+        },
         users() {
-            return this.$store.state.collaboration[this.channelName].users;
+            return this.collaborationState?.users || [];
         },
         connecting() {
             return this.users.length === 0;
