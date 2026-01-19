@@ -411,6 +411,14 @@ export default class Workspace {
             this.queuePendingUpdate(handle, type, windowId);
         });
 
+        // Listen for sync-now notifications - another user finished editing and wants us to sync
+        this.channel.listenForWhisper('sync-now', ({ windowId }) => {
+            if (windowId === this.windowId) return;
+
+            this.debug(`📥 Received sync-now from ${windowId?.slice(-6)}, triggering pending updates`);
+            this.triggerPendingUpdates();
+        });
+
         this.listenForWhisper('focus', ({ user, handle, windowId }) => {
             // Ignore focus events from our own other windows
             if (windowId === this.windowId) return;
@@ -629,6 +637,9 @@ export default class Workspace {
             // Trigger any pending updates when leaving a field
             this.triggerPendingUpdates();
 
+            // Tell other clients to sync now (fetch latest from server)
+            this.channel.whisper('sync-now', { windowId: this.windowId });
+
             // Delay unlock by 3 seconds - still inform others immediately via focus state
             this.blur(user);
             this.whisper('blur', { user, handle, windowId: this.windowId });
@@ -672,6 +683,11 @@ export default class Workspace {
         }
 
         this.currentFocusedField = null;
+
+        // Trigger any pending updates and tell others to sync
+        this.triggerPendingUpdates();
+        this.channel.whisper('sync-now', { windowId: this.windowId });
+
         this.blur(this.user);
         this.whisper('blur', { user: this.user, handle, windowId: this.windowId });
         Statamic.$toast.info(`Field auto-unlocked due to inactivity.`, { duration: 2000 });
