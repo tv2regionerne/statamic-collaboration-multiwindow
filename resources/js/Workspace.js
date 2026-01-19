@@ -53,6 +53,9 @@ export default class Workspace {
 
         // Track fields currently locked by other users
         this.lockedFields = {};
+
+        // Track which fields have changed since last sync
+        this.changedFields = new Set();
     }
 
     /**
@@ -172,16 +175,17 @@ export default class Workspace {
 
         // Listen for focus events (field locking)
         this.channel.listenForWhisper('focus', ({ windowId, user, handle }) => {
+            // Ignore our own window's focus events
             if (windowId === this.windowId) return;
-            if (user.id === this.user.id) return; // Don't lock for our own other windows
 
+            // Lock field even for same user's other windows
             this.lockField(user, handle);
         });
 
         // Listen for blur events (field unlocking after delay)
         this.channel.listenForWhisper('blur', ({ windowId, user, handle }) => {
+            // Ignore our own window's blur events
             if (windowId === this.windowId) return;
-            if (user.id === this.user.id) return;
 
             // Unlock after 3 seconds
             this.scheduleFieldUnlock(user, handle);
@@ -342,12 +346,13 @@ export default class Workspace {
     onFieldValueChanged(payload) {
         const { handle, value } = payload;
 
-        // Check if value actually changed
+        // Check if value actually changed from last synced state
         if (JSON.stringify(this.lastValues[handle]) === JSON.stringify(value)) {
             return;
         }
 
-        this.lastValues[handle] = clone(value);
+        // Mark field as changed (don't update lastValues until sync)
+        this.changedFields.add(handle);
         this.debug(`Field "${handle}" value changed`);
 
         // Reset inactivity timer
@@ -360,12 +365,13 @@ export default class Workspace {
     onFieldMetaChanged(payload) {
         const { handle, value } = payload;
 
-        // Check if meta actually changed
+        // Check if meta actually changed from last synced state
         if (JSON.stringify(this.lastMeta[handle]) === JSON.stringify(value)) {
             return;
         }
 
-        this.lastMeta[handle] = clone(value);
+        // Mark field as changed (don't update lastMeta until sync)
+        this.changedFields.add(handle);
         this.debug(`Field "${handle}" meta changed`);
 
         // Reset inactivity timer
@@ -398,37 +404,25 @@ export default class Workspace {
     async syncChangedFields() {
         this.clearInactivityTimer();
 
-        const currentValues = Statamic.$store.state.publish[this.container.name].values;
-        const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
-
-        // Find changed values
-        const changedHandles = new Set();
-
-        for (const handle of Object.keys(currentValues)) {
-            if (JSON.stringify(currentValues[handle]) !== JSON.stringify(this.lastValues[handle])) {
-                changedHandles.add(handle);
-            }
-        }
-
-        for (const handle of Object.keys(currentMeta)) {
-            if (JSON.stringify(currentMeta[handle]) !== JSON.stringify(this.lastMeta[handle])) {
-                changedHandles.add(handle);
-            }
-        }
-
-        if (changedHandles.size === 0) {
+        // Nothing to sync?
+        if (this.changedFields.size === 0) {
             return;
         }
 
-        this.debug(`Syncing ${changedHandles.size} changed field(s)...`);
+        const currentValues = Statamic.$store.state.publish[this.container.name].values;
+        const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
+
+        this.debug(`Syncing ${this.changedFields.size} changed field(s):`, [...this.changedFields]);
 
         // Persist each changed field to server
-        for (const handle of changedHandles) {
+        for (const handle of this.changedFields) {
             if (currentValues[handle] !== undefined) {
                 await this.persistField(handle, currentValues[handle], 'value');
+                this.lastValues[handle] = clone(currentValues[handle]);
             }
             if (currentMeta[handle] !== undefined) {
                 await this.persistField(handle, currentMeta[handle], 'meta');
+                this.lastMeta[handle] = clone(currentMeta[handle]);
             }
 
             // Notify others to fetch this field
@@ -438,9 +432,8 @@ export default class Workspace {
             });
         }
 
-        // Update our tracking
-        this.lastValues = clone(currentValues);
-        this.lastMeta = clone(currentMeta);
+        // Clear the changed fields set
+        this.changedFields.clear();
     }
 
     // =========================================================================
