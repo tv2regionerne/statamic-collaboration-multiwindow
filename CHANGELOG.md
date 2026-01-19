@@ -1,5 +1,26 @@
 # Release Notes
 
+> **Fork notice:** This is a fork of [statamic/collaboration](https://github.com/statamic/collaboration) with multi-window support and additional features.
+
+## 1.2.0-multiwindow (2026-01-19)
+
+### What's new
+- Multi-window support: Same user can edit in multiple browser tabs simultaneously.
+- Window-specific field locking prevents conflicts between tabs.
+- Server-side state caching via Laravel Cache (supports file, database, Redis, etc.) with 12-hour persistence.
+- Real-time value synchronization across all connected windows.
+- Upgraded to Vite 6.
+
+### Technical changes
+- Added unique `windowId` per browser tab for presence tracking.
+- State persisted via `StateController` REST API.
+
+---
+
+## Upstream Changelog
+
+*The following entries are from the original [statamic/collaboration](https://github.com/statamic/collaboration) package.*
+
 ## 1.0.1 (2025-06-30)
 
 ### What's fixed

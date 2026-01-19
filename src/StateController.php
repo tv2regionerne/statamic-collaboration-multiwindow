@@ -12,14 +12,14 @@ class StateController extends Controller
     /**
      * Cache TTL in seconds (24 hours - states expire after no activity)
      */
-    protected int $ttl = 86400;
+    protected int $ttl = 44000;
 
     /**
      * Get the cached state for an entry.
      */
     public function show(Request $request, string $reference, string $site)
     {
-        if (! $this->userCanEditEntry($reference)) {
+        if (!$this->userCanEditEntry($reference)) {
             abort(403);
         }
 
@@ -27,7 +27,7 @@ class StateController extends Controller
 
         $state = Cache::get($key);
 
-        if (! $state) {
+        if (!$state) {
             return response()->json([
                 'exists' => false,
                 'values' => null,
@@ -47,7 +47,7 @@ class StateController extends Controller
      */
     public function update(Request $request, string $reference, string $site)
     {
-        if (! $this->userCanEditEntry($reference)) {
+        if (!$this->userCanEditEntry($reference)) {
             abort(403);
         }
 
@@ -79,7 +79,7 @@ class StateController extends Controller
      */
     public function destroy(Request $request, string $reference, string $site)
     {
-        if (! $this->userCanEditEntry($reference)) {
+        if (!$this->userCanEditEntry($reference)) {
             abort(403);
         }
 
@@ -99,7 +99,7 @@ class StateController extends Controller
         $guard = config('statamic.users.guards.cp', 'web');
         $authUser = Auth::guard($guard)->user();
 
-        if (! $authUser) {
+        if (!$authUser) {
             return false;
         }
 
