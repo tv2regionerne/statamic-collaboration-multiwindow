@@ -259,6 +259,12 @@ export default class Workspace {
             this.subscribeToVuexMutations();
             Statamic.$store.commit(`collaboration/${this.channelName}/setUsers`, users);
 
+            // If there are other users already in the entry, remove autofocus
+            // to prevent unintentional field locking
+            if (users.length > 1 && document.activeElement && document.activeElement !== document.body) {
+                document.activeElement.blur();
+            }
+
             // Register our own window
             this.activeWindows.add(this.windowId);
 
