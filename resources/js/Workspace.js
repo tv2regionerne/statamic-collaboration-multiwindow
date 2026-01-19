@@ -255,10 +255,10 @@ export default class Workspace {
             // Respond so the new window knows about us
             this.channel.whisper('window-present', { windowId: this.windowId, user: this.user });
 
-            // Send current state to the new window
+            // Send current state to the new window (full meta to preserve image URLs etc.)
             this.channel.whisper(`initialize-state-for-window-${windowId}`, {
                 values: Statamic.$store.state.publish[this.container.name].values,
-                meta: this.cleanEntireMetaPayload(Statamic.$store.state.publish[this.container.name].meta),
+                meta: Statamic.$store.state.publish[this.container.name].meta,
                 focus: Statamic.$store.state.collaboration[this.channelName].focus,
                 fromWindowId: this.windowId,
             });
@@ -762,16 +762,26 @@ export default class Workspace {
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
-            const cleanedPayload = { ...this.cleanMetaPayload(payload), windowId: this.windowId };
+            // Check if this is a complex field (has __collaboration key, e.g., Bard with images)
+            const isComplexField = data_get(payload, 'value.__collaboration') !== null;
 
-            // For large payloads (>3KB), persist immediately and notify others to fetch from server
-            if (JSON.stringify(cleanedPayload).length > 3000) {
-                this.debug(`📦 Large meta payload for "${payload.handle}", persisting and sending fetch notification`);
-                // Wait for persist to complete before notifying others to fetch
+            if (isComplexField) {
+                // For complex fields (like Bard with images), always use server fetch
+                // This ensures all nested data (image URLs, etc.) is properly synced
+                this.debug(`📦 Complex field "${payload.handle}", persisting full meta and sending fetch notification`);
                 await this.sendStateUpdate(payload.handle, payload.value, 'meta');
                 this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
             } else {
-                this.whisper('meta-updated', cleanedPayload);
+                const fullPayload = { ...payload, windowId: this.windowId };
+
+                // For large payloads (>3KB), persist and notify others to fetch from server
+                if (JSON.stringify(fullPayload).length > 3000) {
+                    this.debug(`📦 Large meta payload for "${payload.handle}", persisting and sending fetch notification`);
+                    await this.sendStateUpdate(payload.handle, payload.value, 'meta');
+                    this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
+                } else {
+                    this.whisper('meta-updated', fullPayload);
+                }
             }
         }
     }

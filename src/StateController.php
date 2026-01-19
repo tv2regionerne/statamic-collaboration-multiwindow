@@ -64,9 +64,11 @@ class StateController extends Controller
         if ($validated['type'] === 'value') {
             $state['values'][$validated['handle']] = $validated['value'];
         } else {
-            // For meta, merge with existing to preserve __collaboration keys
+            // For meta, use array_replace_recursive to deep merge nested structures
+            // This preserves image URLs, cached data, and other nested properties
             $existingMeta = $state['meta'][$validated['handle']] ?? [];
-            $state['meta'][$validated['handle']] = [...$existingMeta, ...($validated['value'] ?? [])];
+            $newMeta = $validated['value'] ?? [];
+            $state['meta'][$validated['handle']] = array_replace_recursive($existingMeta, $newMeta);
         }
 
         Cache::put($key, $state, $this->ttl);
