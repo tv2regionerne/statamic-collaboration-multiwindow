@@ -132,6 +132,14 @@ export default class Workspace {
 
             if (isNowVisible && this.wasHidden) {
                 this.wasHidden = false;
+
+                // Skip sync if we have recent local changes (user is actively editing)
+                const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
+                if (timeSinceLastChange < this.localChangeProtectionMs) {
+                    this.debug(`👁️ Window became visible but skipping sync - local change was ${timeSinceLastChange}ms ago`);
+                    return;
+                }
+
                 this.debug('👁️ Window became visible after being hidden, syncing state...');
 
                 // Wait for WebSocket connection to be ready before syncing
@@ -282,6 +290,13 @@ export default class Workspace {
         // Listen for initial state from other windows (targeted to our windowId)
         // This always merges state since other windows may have fresher data than cached state
         this.channel.listenForWhisper(`initialize-state-for-window-${this.windowId}`, payload => {
+            // Don't apply if we have recent local changes (prevents overwriting our own edits)
+            const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
+            if (timeSinceLastChange < this.localChangeProtectionMs) {
+                this.debug(`🛡️ Skipping initialize-state - local change was ${timeSinceLastChange}ms ago`);
+                return;
+            }
+
             this.debug('✅ Applying/merging state from another window', payload);
 
             // Mark that we're applying external data to prevent re-broadcasting
@@ -772,9 +787,11 @@ export default class Workspace {
             const payloadClone = { ...payload, value: clone(payload.value) };
             const cleanedPayload = { ...this.cleanMetaPayload(payloadClone), windowId: this.windowId };
 
-            // For large payloads (>3KB), persist and notify others to fetch from server
+            // For large payloads (>3KB), persist immediately and notify others to fetch from server
             if (JSON.stringify(cleanedPayload).length > 3000) {
-                this.debug(`📦 Large meta payload for "${payload.handle}", sending fetch notification`);
+                this.debug(`📦 Large meta payload for "${payload.handle}", persisting and sending fetch notification`);
+                // Wait for persist to complete before notifying others to fetch
+                await this.sendStateUpdate(payload.handle, payload.value, 'meta');
                 this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
             } else {
                 this.whisper('meta-updated', cleanedPayload);
@@ -1000,9 +1017,10 @@ export default class Workspace {
         }
 
         // Don't overwrite if user has made recent local changes (protects against losing typing)
+        // This applies to all sources now, not just fetch-field listener
         const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-        if (source === 'fetch-field listener' && timeSinceLastChange < this.localChangeProtectionMs) {
-            this.debug(`🛡️ Skipping loadCachedState - local change was ${timeSinceLastChange}ms ago (protection: ${this.localChangeProtectionMs}ms)`);
+        if (timeSinceLastChange < this.localChangeProtectionMs) {
+            this.debug(`🛡️ Skipping loadCachedState (${source}) - local change was ${timeSinceLastChange}ms ago (protection: ${this.localChangeProtectionMs}ms)`);
             return;
         }
 
