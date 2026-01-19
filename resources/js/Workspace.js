@@ -24,8 +24,13 @@ export default class Workspace {
         this.started = false;
         this.storeSubscriber = null;
 
-        // User info
-        this.user = Statamic.user;
+        // User info (minimal data for whispers to avoid Pusher's 10KB limit)
+        this.user = {
+            id: Statamic.user.id,
+            name: Statamic.user.name,
+            initials: Statamic.user.initials,
+            avatar: Statamic.user.avatar,
+        };
 
         // Unique ID for this browser tab
         this.windowId = this.generateWindowId();
