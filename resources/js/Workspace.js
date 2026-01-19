@@ -500,7 +500,6 @@ export default class Workspace {
         const component = this.container.pushComponent('CollaborationStatusBar', {
             props: {
                 channelName: this.channelName,
-                connecting: this.connecting,
             }
         });
 

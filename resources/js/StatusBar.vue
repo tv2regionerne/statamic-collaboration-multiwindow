@@ -26,9 +26,6 @@
 export default {
 
     props: {
-        container: {
-            required: true,
-        },
         channelName: {
             type: String,
             required: true,
