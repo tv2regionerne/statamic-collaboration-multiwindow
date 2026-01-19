@@ -28,12 +28,19 @@ class StateController extends Controller
         $state = Cache::get($key);
 
         if (!$state) {
+            \Log::debug('Collaboration: No cached state found', ['key' => $key]);
             return response()->json([
                 'exists' => false,
                 'values' => null,
                 'meta' => null,
             ]);
         }
+
+        \Log::debug('Collaboration: Returning cached state', [
+            'key' => $key,
+            'values_keys' => array_keys($state['values'] ?? []),
+            'meta_keys' => array_keys($state['meta'] ?? []),
+        ]);
 
         return response()->json([
             'exists' => true,
@@ -55,10 +62,19 @@ class StateController extends Controller
 
         // Handle full state update (all values and meta at once)
         if ($request->boolean('full')) {
+            // Use json() to get the raw JSON data (handles large nested arrays better)
+            $json = $request->json()->all();
             $state = [
-                'values' => $request->input('values', []),
-                'meta' => $request->input('meta', []),
+                'values' => $json['values'] ?? [],
+                'meta' => $json['meta'] ?? [],
             ];
+
+            \Log::debug('Collaboration: Saving full state', [
+                'key' => $key,
+                'values_keys' => array_keys($state['values']),
+                'meta_keys' => array_keys($state['meta']),
+            ]);
+
             Cache::put($key, $state, $this->ttl);
             return response()->json(['success' => true]);
         }

@@ -599,7 +599,7 @@ export default class Workspace {
             this.whisper('focus', { user, handle, windowId: this.windowId });
         });
 
-        this.container.$on('blur', handle => {
+        this.container.$on('blur', async handle => {
             const user = this.user;
 
             // Stop sync interval and inactivity timer
@@ -607,12 +607,13 @@ export default class Workspace {
             this.clearFieldInactivityTimer();
             this.currentFocusedField = null;
 
-            // Persist any pending changes immediately
+            // Persist any pending changes immediately and WAIT for it to complete
             if (this.hasPendingChanges) {
-                this.persistAllChanges();
+                await this.persistAllChangesSync();
             }
 
             // Tell other clients to sync now (fetch latest from server)
+            // Now the data is guaranteed to be on the server
             this.channel.whisper('sync-now', { windowId: this.windowId });
 
             // Inform about blur but schedule delayed unlock
@@ -1068,12 +1069,14 @@ export default class Workspace {
                 this.debug('📝 setValues commit completed');
             }
 
-            // Apply cached meta - merge with current meta
+            // Apply cached meta - replace full meta for each field (needed for assets to show correctly)
             if (data.meta && Object.keys(data.meta).length > 0) {
                 const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
                 const mergedMeta = { ...currentMeta };
                 Object.keys(data.meta).forEach(handle => {
-                    mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
+                    // Replace entire meta object for this field (not merge)
+                    // This ensures asset previews, thumbnails etc. work correctly
+                    mergedMeta[handle] = data.meta[handle];
                 });
 
                 this.debug('📝 Committing setMeta...', {
@@ -1083,7 +1086,7 @@ export default class Workspace {
 
                 // Update lastMetaValues so we don't re-send these as changes
                 Object.keys(data.meta).forEach(handle => {
-                    this.lastMetaValues[handle] = clone(mergedMeta[handle]);
+                    this.lastMetaValues[handle] = clone(data.meta[handle]);
                 });
                 this.debug('📝 setMeta commit completed');
             }
