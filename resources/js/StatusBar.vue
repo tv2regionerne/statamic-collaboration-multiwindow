@@ -34,7 +34,11 @@ export default {
 
     computed: {
         collaborationState() {
-            return this.$store.state.collaboration?.[this.channelName];
+            // Defensive check: store or collaboration module might not be ready yet
+            if (!this.$store || !this.$store.state || !this.$store.state.collaboration || !this.channelName) {
+                return null;
+            }
+            return this.$store.state.collaboration[this.channelName] || null;
         },
         users() {
             return this.collaborationState?.users || [];
