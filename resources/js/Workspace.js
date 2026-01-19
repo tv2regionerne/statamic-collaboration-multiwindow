@@ -94,35 +94,6 @@ export default class Workspace {
 
         // Cached CSRF token (looked up once, reused for all requests)
         this._csrfToken = null;
-
-        // Cached Vuex store paths (avoids string concatenation on every access)
-        this._storePaths = null;
-    }
-
-    /**
-     * Get cached Vuex store paths for this container.
-     * Lazily initialized on first access.
-     * @returns {Object} Object containing commonly used store paths
-     */
-    get storePaths() {
-        if (!this._storePaths) {
-            this._storePaths = {
-                values: `publish/${this.container.name}/setValues`,
-                meta: `publish/${this.container.name}/setMeta`,
-                fieldValue: `publish/${this.container.name}/setFieldValue`,
-                fieldMeta: `publish/${this.container.name}/setFieldMeta`,
-                lockField: `publish/${this.container.name}/lockField`,
-                unlockField: `publish/${this.container.name}/unlockField`,
-                setUsers: `collaboration/${this.channelName}/setUsers`,
-                addUser: `collaboration/${this.channelName}/addUser`,
-                removeUser: `collaboration/${this.channelName}/removeUser`,
-                focus: `collaboration/${this.channelName}/focus`,
-                blur: `collaboration/${this.channelName}/blur`,
-                setSaveStatus: `collaboration/${this.channelName}/setSaveStatus`,
-                setOriginalValues: `collaboration/${this.channelName}/setOriginalValues`,
-            };
-        }
-        return this._storePaths;
     }
 
     /**
@@ -320,6 +291,21 @@ export default class Workspace {
             this.cancelPendingUnlock(handle);
         });
 
+        // If we have a focused field, release it properly before leaving
+        if (this.currentFocusedField) {
+            const handle = this.currentFocusedField;
+            this.currentFocusedField = null;
+
+            // Notify others about blur so they can unlock the field
+            this.blur(this.user);
+            this.whisper('blur', { user: this.user, handle, windowId: this.windowId });
+        }
+
+        // Persist any pending changes before leaving (fire-and-forget, don't await)
+        if (this.hasPendingChanges) {
+            this.persistAllChanges();
+        }
+
         // Remove event listeners
         if (this.keypressHandler) {
             document.removeEventListener('keydown', this.keypressHandler);
@@ -437,7 +423,7 @@ export default class Workspace {
                 // Merge received values with current state
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
                 const mergedValues = { ...currentValues, ...payload.values };
-                Statamic.$store.commit(this.storePaths.values, mergedValues);
+                Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
 
                 // Merge received meta with current state
                 const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
@@ -446,7 +432,7 @@ export default class Workspace {
                 Object.keys(restoredMeta).forEach(handle => {
                     mergedMeta[handle] = { ...currentMeta[handle], ...restoredMeta[handle] };
                 });
-                Statamic.$store.commit(this.storePaths.meta, mergedMeta);
+                Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
             } finally {
                 this.applyingBroadcast = false;
             }
@@ -551,8 +537,8 @@ export default class Workspace {
 
             // Update our state to reflect the save
             const currentValues = Statamic.$store.state.publish[this.container.name].values;
-            Statamic.$store.commit(this.storePaths.setOriginalValues, clone(currentValues));
-            Statamic.$store.commit(this.storePaths.setSaveStatus, 'saved');
+            Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
+            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
 
             this.unsavedToastShown = false;
             this.notSavedToastShown = false;
@@ -655,8 +641,8 @@ export default class Workspace {
             if (reference === this.container.reference) {
                 // Update local state to reflect save
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                Statamic.$store.commit(this.storePaths.setOriginalValues, clone(currentValues));
-                Statamic.$store.commit(this.storePaths.setSaveStatus, 'saved');
+                Statamic.$store.commit(`collaboration/${this.channelName}/setOriginalValues`, clone(currentValues));
+                Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
 
                 this.unsavedToastShown = false;
                 this.notSavedToastShown = false;
@@ -867,7 +853,7 @@ export default class Workspace {
             await this.loadCachedState('before-unlock');
 
             this.debug(`Executing delayed unlock for "${handle}"`);
-            Statamic.$store.commit(this.storePaths.unlockField, handle);
+            Statamic.$store.commit(`publish/${this.container.name}/unlockField`, handle);
             delete this.pendingFieldUnlocks[handle];
         }, this.fieldUnlockDelay);
     }
@@ -891,7 +877,7 @@ export default class Workspace {
      * @param {string} handle - The field handle
      */
     focus(user, handle) {
-        Statamic.$store.commit(this.storePaths.focus, { user, handle });
+        Statamic.$store.commit(`collaboration/${this.channelName}/focus`, { user, handle });
     }
 
     /**
@@ -901,7 +887,7 @@ export default class Workspace {
      */
     focusAndLock(user, handle) {
         this.focus(user, handle);
-        Statamic.$store.commit(this.storePaths.lockField, { user, handle });
+        Statamic.$store.commit(`publish/${this.container.name}/lockField`, { user, handle });
     }
 
     /**
@@ -909,7 +895,7 @@ export default class Workspace {
      * @param {Object} user - The user object
      */
     blur(user) {
-        Statamic.$store.commit(this.storePaths.blur, user);
+        Statamic.$store.commit(`collaboration/${this.channelName}/blur`, user);
     }
 
     /**
@@ -921,7 +907,7 @@ export default class Workspace {
         handle = handle || data_get(Statamic.$store.state.collaboration[this.channelName], `focus.${user.id}.handle`);
         if (!handle) return;
         this.blur(user);
-        Statamic.$store.commit(this.storePaths.unlockField, handle);
+        Statamic.$store.commit(`publish/${this.container.name}/unlockField`, handle);
     }
 
     /**
@@ -1028,14 +1014,14 @@ export default class Workspace {
         const hasChanges = JSON.stringify(currentValues) !== JSON.stringify(originalValues);
 
         if (hasChanges && currentStatus !== 'changesNotSaved') {
-            Statamic.$store.commit(this.storePaths.setSaveStatus, 'changesNotSaved');
+            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'changesNotSaved');
             this.debug('Save status changed to: changesNotSaved');
             if (!this.unsavedToastShown) {
                 this.unsavedToastShown = true;
                 Statamic.$toast.info('Unsaved changes — stored temporarily for 12 hours.');
             }
         } else if (!hasChanges && currentStatus !== 'saved') {
-            Statamic.$store.commit(this.storePaths.setSaveStatus, 'saved');
+            Statamic.$store.commit(`collaboration/${this.channelName}/setSaveStatus`, 'saved');
             this.debug('Save status changed to: saved');
             this.unsavedToastShown = false;
         }
@@ -1285,7 +1271,7 @@ export default class Workspace {
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
                 const mergedValues = { ...currentValues, ...data.values };
 
-                Statamic.$store.commit(this.storePaths.values, mergedValues);
+                Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
 
                 // Update cache to prevent re-sending
                 Object.keys(data.values).forEach(handle => {
@@ -1301,7 +1287,7 @@ export default class Workspace {
                     mergedMeta[handle] = data.meta[handle];
                 });
 
-                Statamic.$store.commit(this.storePaths.meta, mergedMeta);
+                Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
 
                 // Update cache to prevent re-sending
                 Object.keys(data.meta).forEach(handle => {

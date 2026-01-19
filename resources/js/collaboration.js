@@ -20,7 +20,11 @@ Statamic.$echo.booted(Echo => {
 Statamic.$events.$on('publish-container-created', container => {
     if (!container.reference) return;
     manager.addWorkspace(container);
-    window.addEventListener('unload', () => manager.destroyWorkspace(container));
+
+    // Use pagehide instead of deprecated unload event
+    // pagehide fires reliably when navigating away and is the modern replacement
+    const cleanup = () => manager.destroyWorkspace(container);
+    window.addEventListener('pagehide', cleanup, { once: true });
 });
 
 Statamic.$events.$on('publish-container-destroyed', container => {
