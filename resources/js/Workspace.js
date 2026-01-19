@@ -140,11 +140,6 @@ export default class Workspace {
         this.channel.here(users => {
             this.debug(`Channel joined! Users in channel:`, users.map(u => u.name));
             Statamic.$store.commit(`collaboration/${this.channelName}/setUsers`, users);
-            this.channel.whisper('window-joined', {
-                windowId: this.windowId,
-                user: this.user
-            });
-            this.debug(`Sent window-joined whisper`);
         });
 
         // User joined the channel
