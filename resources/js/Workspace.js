@@ -255,10 +255,11 @@ export default class Workspace {
             // Respond so the new window knows about us
             this.channel.whisper('window-present', { windowId: this.windowId, user: this.user });
 
-            // Send current state to the new window (full meta to preserve image URLs etc.)
+            // Send current state to the new window (cleaned meta to avoid component errors)
+            // The new window will get full data from server via loadCachedState
             this.channel.whisper(`initialize-state-for-window-${windowId}`, {
                 values: Statamic.$store.state.publish[this.container.name].values,
-                meta: Statamic.$store.state.publish[this.container.name].meta,
+                meta: this.cleanEntireMetaPayload(Statamic.$store.state.publish[this.container.name].meta),
                 focus: Statamic.$store.state.collaboration[this.channelName].focus,
                 fromWindowId: this.windowId,
             });
@@ -352,8 +353,12 @@ export default class Workspace {
                 return;
             }
 
-            this.debug(`📥 Fetching ${type} for "${handle}" from server (large payload)`);
-            this.loadCachedState('fetch-field listener'); // Reload all state from server
+            // Wait a bit for the sender's persist to complete before fetching
+            // (broadcast fires at 500ms, persist at 1000ms, so we wait 600ms to be safe)
+            this.debug(`📥 Will fetch ${type} for "${handle}" from server in 600ms`);
+            setTimeout(() => {
+                this.loadCachedState('fetch-field listener');
+            }, 600);
         });
 
         this.listenForWhisper('meta-updated', e => {
@@ -762,16 +767,27 @@ export default class Workspace {
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
-            // Send full payload (not cleaned/filtered) to preserve image URLs and nested data
-            const fullPayload = { ...payload, windowId: this.windowId };
+            // Check if this is a complex field (has __collaboration key, e.g., Bard)
+            const isComplexField = data_get(payload, 'value.__collaboration') !== null;
 
-            // For large payloads (>3KB), persist and notify others to fetch from server
-            if (JSON.stringify(fullPayload).length > 3000) {
-                this.debug(`📦 Large meta payload for "${payload.handle}", persisting and sending fetch notification`);
-                await this.sendStateUpdate(payload.handle, payload.value, 'meta');
+            if (isComplexField) {
+                // For complex fields, notify others to fetch from server (ensures full data including image URLs)
+                // The persist happens via the debounced persistMetaChange in vuexFieldMetaHasBeenSet
+                this.debug(`📦 Complex field "${payload.handle}", sending fetch notification`);
                 this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
             } else {
-                this.whisper('meta-updated', fullPayload);
+                // For simple fields, broadcast directly via WebSocket (faster)
+                // Clone payload to avoid mutating the original (persist needs full data)
+                const payloadClone = { ...payload, value: clone(payload.value) };
+                const cleanedPayload = { ...this.cleanMetaPayload(payloadClone), windowId: this.windowId };
+
+                // For large payloads (>3KB), use fetch-field instead
+                if (JSON.stringify(cleanedPayload).length > 3000) {
+                    this.debug(`📦 Large meta payload for "${payload.handle}", sending fetch notification`);
+                    this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
+                } else {
+                    this.whisper('meta-updated', cleanedPayload);
+                }
             }
         }
     }
@@ -828,6 +844,12 @@ export default class Workspace {
             return;
         }
 
+        // Skip if value is undefined or null (prevents component errors)
+        if (payload.value === undefined || payload.value === null) {
+            this.debug(`🛡️ Skipping value change - value is ${payload.value}`);
+            return;
+        }
+
         this.debug('✅ Applying broadcasted value change', payload);
 
         // Mark that we're applying a broadcast to prevent re-broadcasting
@@ -847,6 +869,12 @@ export default class Workspace {
         const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
         if (timeSinceLastChange < this.localChangeProtectionMs) {
             this.debug(`🛡️ Skipping meta change - local change was ${timeSinceLastChange}ms ago`);
+            return;
+        }
+
+        // Skip if value is undefined or null (prevents component errors)
+        if (payload.value === undefined || payload.value === null) {
+            this.debug(`🛡️ Skipping meta change - value is ${payload.value}`);
             return;
         }
 
