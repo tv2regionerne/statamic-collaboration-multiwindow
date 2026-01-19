@@ -35,6 +35,9 @@ export default class Workspace {
         this.lastLocalChangeTime = 0;
         this.localChangeProtectionMs = 3000; // Don't overwrite if changed within last 3 seconds
 
+        // Track fields recently updated via broadcast (to avoid overwriting with stale server data)
+        this.recentBroadcastUpdates = {}; // { handle: timestamp }
+
         this.debouncedBroadcastValueChangeFuncsByHandle = {};
         this.debouncedBroadcastMetaChangeFuncsByHandle = {};
         this.debouncedPersistValueFuncsByHandle = {};
@@ -859,6 +862,9 @@ export default class Workspace {
 
         this.debug('✅ Applying broadcasted value change', payload);
 
+        // Track this field as recently updated via broadcast (to protect from stale server data)
+        this.recentBroadcastUpdates[payload.handle] = Date.now();
+
         // Mark that we're applying a broadcast to prevent re-broadcasting
         this.applyingBroadcast = true;
         try {
@@ -887,6 +893,9 @@ export default class Workspace {
         }
 
         this.debug('✅ Applying broadcasted meta change', payload);
+
+        // Track this field as recently updated via broadcast (to protect from stale server data)
+        this.recentBroadcastUpdates[payload.handle] = Date.now();
 
         let value = { ...this.lastMetaValues[payload.handle], ...payload.value };
         payload.value = value;
@@ -1055,22 +1064,39 @@ export default class Workspace {
             this.debug('✅ Applying cached state from server', data);
 
             // Apply cached values - merge with current values
+            // Skip fields that were recently updated via broadcast (server may have stale data)
             // Use commit instead of dispatch to avoid triggering autosave
             if (data.values && Object.keys(data.values).length > 0) {
                 const currentValues = Statamic.$store.state.publish[this.container.name].values;
-                const mergedValues = { ...currentValues, ...data.values };
+                const mergedValues = { ...currentValues };
+
+                Object.keys(data.values).forEach(handle => {
+                    const recentUpdate = this.recentBroadcastUpdates[handle];
+                    if (recentUpdate && (Date.now() - recentUpdate) < this.localChangeProtectionMs) {
+                        this.debug(`🛡️ Skipping server value for "${handle}" - recently updated via broadcast`);
+                    } else {
+                        mergedValues[handle] = data.values[handle];
+                    }
+                });
+
                 this.debug('📝 Committing setValues...');
                 Statamic.$store.commit(`publish/${this.container.name}/setValues`, mergedValues);
                 this.debug('📝 setValues commit completed');
             }
 
             // Apply cached meta - merge with current meta
+            // Skip fields that were recently updated via broadcast
             // Use commit instead of dispatch to avoid triggering autosave
             if (data.meta && Object.keys(data.meta).length > 0) {
                 const currentMeta = Statamic.$store.state.publish[this.container.name].meta;
                 const mergedMeta = { ...currentMeta };
                 Object.keys(data.meta).forEach(handle => {
-                    mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
+                    const recentUpdate = this.recentBroadcastUpdates[handle];
+                    if (recentUpdate && (Date.now() - recentUpdate) < this.localChangeProtectionMs) {
+                        this.debug(`🛡️ Skipping server meta for "${handle}" - recently updated via broadcast`);
+                    } else {
+                        mergedMeta[handle] = { ...currentMeta[handle], ...data.meta[handle] };
+                    }
                 });
                 Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
             }
