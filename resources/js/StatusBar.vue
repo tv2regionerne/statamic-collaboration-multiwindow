@@ -32,8 +32,22 @@ export default {
         }
     },
 
+    data() {
+        return {
+            ready: false,
+        };
+    },
+
+    mounted() {
+        // Delay initialization to ensure store is ready
+        this.$nextTick(() => {
+            this.ready = true;
+        });
+    },
+
     computed: {
         collaborationState() {
+            if (!this.ready) return null;
             if (!this.$store || !this.$store.state || !this.$store.state.collaboration) {
                 return null;
             }
@@ -46,6 +60,7 @@ export default {
             return this.collaborationState.users;
         },
         isConnecting() {
+            if (!this.ready) return true;
             return this.users.length === 0;
         }
     }

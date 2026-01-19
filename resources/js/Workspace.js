@@ -560,6 +560,8 @@ export default class Workspace {
      */
     async fetchAndApplyField(handle) {
         try {
+            this.debug(`GET ${this.stateApiUrl} (for field "${handle}")`);
+
             const response = await fetch(this.stateApiUrl, {
                 headers: {
                     'Accept': 'application/json',
@@ -568,18 +570,27 @@ export default class Workspace {
                 credentials: 'same-origin',
             });
 
-            if (!response.ok) return;
+            if (!response.ok) {
+                this.debug(`FAILED to fetch field "${handle}": ${response.status}`);
+                return;
+            }
 
             const data = await response.json();
-            if (!data.exists) return;
+            this.debug(`Fetched for field "${handle}":`, data);
+
+            if (!data.exists) {
+                this.debug(`No cached state for field "${handle}"`);
+                return;
+            }
 
             // Apply only the specific field
             const values = data.values?.[handle] !== undefined ? { [handle]: data.values[handle] } : null;
             const meta = data.meta?.[handle] !== undefined ? { [handle]: data.meta[handle] } : null;
 
+            this.debug(`Applying field "${handle}":`, { values, meta });
             this.applyState(values, meta);
         } catch (error) {
-            this.debug(`Failed to fetch field "${handle}"`, error);
+            this.debug(`ERROR fetching field "${handle}"`, error);
         }
     }
 
@@ -624,7 +635,10 @@ export default class Workspace {
                 Statamic.$store.commit(`publish/${this.container.name}/setMeta`, mergedMeta);
             }
         } finally {
-            this.applyingRemoteChange = false;
+            // Delay resetting the flag to allow Vuex cascading mutations to complete
+            setTimeout(() => {
+                this.applyingRemoteChange = false;
+            }, 300);
         }
     }
 
