@@ -42,24 +42,27 @@ export default {
     },
 
     computed: {
-        collaborationState() {
+        collaborationState: function() {
             // Defensive check: store or collaboration module might not be ready yet
-            if (!this.ready || !this.$store?.state?.collaboration || !this.channelName) {
-                return null;
-            }
+            if (!this.ready) return null;
+            if (!this.$store) return null;
+            if (!this.$store.state) return null;
+            if (!this.$store.state.collaboration) return null;
+            if (!this.channelName) return null;
             return this.$store.state.collaboration[this.channelName] || null;
         },
-        userList() {
-            if (!this.collaborationState) return [];
-            return this.collaborationState.users || [];
+        userList: function() {
+            var state = this.collaborationState;
+            if (!state) return [];
+            return state.users || [];
         },
-        isConnecting() {
+        isConnecting: function() {
             return this.userList.length === 0;
         },
-        hasMultipleUsers() {
+        hasMultipleUsers: function() {
             return this.userList.length > 1;
         },
-        statusBarClass() {
+        statusBarClass: function() {
             return {
                 '-mt-2 mb-2': this.isConnecting || this.hasMultipleUsers
             };
