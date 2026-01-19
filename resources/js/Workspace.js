@@ -491,7 +491,9 @@ export default class Workspace {
             const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
                 || Statamic.$config.get('csrfToken');
 
-            await fetch(this.stateApiUrl, {
+            this.debug(`POST ${this.stateApiUrl}`, { handle, type, csrfToken: csrfToken ? 'present' : 'MISSING' });
+
+            const response = await fetch(this.stateApiUrl, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -503,9 +505,18 @@ export default class Workspace {
                 body: JSON.stringify({ handle, value, type }),
             });
 
-            this.debug(`Persisted ${type} for "${handle}"`);
+            if (!response.ok) {
+                const text = await response.text();
+                this.debug(`FAILED to persist ${type} for "${handle}": ${response.status}`, text);
+                return false;
+            }
+
+            const data = await response.json();
+            this.debug(`Persisted ${type} for "${handle}"`, data);
+            return true;
         } catch (error) {
-            this.debug(`Failed to persist ${type} for "${handle}"`, error);
+            this.debug(`ERROR persisting ${type} for "${handle}"`, error);
+            return false;
         }
     }
 
@@ -514,6 +525,8 @@ export default class Workspace {
      */
     async fetchAllState() {
         try {
+            this.debug(`GET ${this.stateApiUrl}`);
+
             const response = await fetch(this.stateApiUrl, {
                 headers: {
                     'Accept': 'application/json',
@@ -522,14 +535,23 @@ export default class Workspace {
                 credentials: 'same-origin',
             });
 
-            if (!response.ok) return;
+            if (!response.ok) {
+                this.debug(`FAILED to fetch state: ${response.status}`);
+                return;
+            }
 
             const data = await response.json();
-            if (!data.exists) return;
+            this.debug('Fetched state from server:', data);
 
+            if (!data.exists) {
+                this.debug('No cached state exists on server');
+                return;
+            }
+
+            this.debug('Applying state from server...');
             this.applyState(data.values, data.meta);
         } catch (error) {
-            this.debug('Failed to fetch state', error);
+            this.debug('ERROR fetching state', error);
         }
     }
 

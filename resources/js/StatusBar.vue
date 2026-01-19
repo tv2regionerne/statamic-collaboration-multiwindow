@@ -1,7 +1,7 @@
 <template>
 
-    <div class="collaboration-status-bar" :class="{ '-mt-2 mb-2': connecting || users.length > 1 }">
-        <loading-graphic v-if="connecting" :inline="true" :size="16" text="Attempting websocket connection..." />
+    <div class="collaboration-status-bar" :class="{ '-mt-2 mb-2': isConnecting || users.length > 1 }">
+        <loading-graphic v-if="isConnecting" :inline="true" :size="16" text="Attempting websocket connection..." />
         <div v-if="users.length > 1" class="flex items-center">
             <div
                 v-for="user in users"
@@ -34,12 +34,18 @@ export default {
 
     computed: {
         collaborationState() {
-            return this.$store.state.collaboration?.[this.channelName];
+            if (!this.$store || !this.$store.state || !this.$store.state.collaboration) {
+                return null;
+            }
+            return this.$store.state.collaboration[this.channelName] || null;
         },
         users() {
-            return this.collaborationState?.users || [];
+            if (!this.collaborationState || !this.collaborationState.users) {
+                return [];
+            }
+            return this.collaborationState.users;
         },
-        connecting() {
+        isConnecting() {
             return this.users.length === 0;
         }
     }
