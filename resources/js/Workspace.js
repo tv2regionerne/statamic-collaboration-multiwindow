@@ -40,8 +40,6 @@ export default class Workspace {
 
         this.debouncedBroadcastValueChangeFuncsByHandle = {};
         this.debouncedBroadcastMetaChangeFuncsByHandle = {};
-        this.debouncedPersistValueFuncsByHandle = {};
-        this.debouncedPersistMetaFuncsByHandle = {};
 
         // Toast notification flags (to avoid duplicate toasts)
         this.notSavedToastShown = false;
@@ -55,6 +53,21 @@ export default class Workspace {
         // BroadcastChannel for reliable same-browser window detection
         this.localChannel = null;
         this.localWindows = new Set();
+
+        // Field lock timing: 3 second delay before unlocking after blur
+        this.fieldUnlockDelay = 3000;
+        this.pendingFieldUnlocks = {}; // { handle: timeoutId }
+
+        // Field inactivity: auto-unlock after 10 seconds of no activity
+        this.fieldInactivityTimeout = 10000;
+        this.fieldInactivityTimers = {}; // { handle: timeoutId }
+        this.currentFocusedField = null;
+
+        // Update timing: only sync data when user is inactive for 3 seconds or presses space/char
+        this.pendingServerUpdates = {}; // { handle: { value, type, timestamp } }
+        this.updateInactivityDelay = 3000;
+        this.updateInactivityTimer = null;
+        this.lastKeyPressTime = 0;
     }
 
     generateWindowId() {
@@ -204,6 +217,26 @@ export default class Workspace {
         // Clear inactivity timer
         this.clearActivityTimer();
 
+        // Clear field inactivity timers
+        Object.keys(this.fieldInactivityTimers).forEach(handle => {
+            this.clearFieldInactivityTimer(handle);
+        });
+
+        // Clear pending field unlocks
+        Object.keys(this.pendingFieldUnlocks).forEach(handle => {
+            this.cancelPendingUnlock(handle);
+        });
+
+        // Clear update inactivity timer
+        if (this.updateInactivityTimer) {
+            clearTimeout(this.updateInactivityTimer);
+        }
+
+        // Remove keypress handler
+        if (this.keypressHandler) {
+            document.removeEventListener('keydown', this.keypressHandler);
+        }
+
         // Remove visibility handler
         if (this.visibilityHandler) {
             document.removeEventListener('visibilitychange', this.visibilityHandler);
@@ -286,6 +319,8 @@ export default class Workspace {
 
         // Listen for windows leaving (use direct listener)
         this.channel.listenForWhisper('window-left', ({ windowId }) => {
+            if (windowId === this.windowId) return;
+
             this.debug(`Window left: ${windowId}`);
             this.activeWindows.delete(windowId);
         });
@@ -293,6 +328,9 @@ export default class Workspace {
         // Listen for initial state from other windows (targeted to our windowId)
         // This always merges state since other windows may have fresher data than cached state
         this.channel.listenForWhisper(`initialize-state-for-window-${this.windowId}`, payload => {
+            // Ignore if from our own window
+            if (payload.fromWindowId === this.windowId) return;
+
             // Don't apply if we have recent local changes (prevents overwriting our own edits)
             const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
             if (timeSinceLastChange < this.localChangeProtectionMs) {
@@ -361,28 +399,16 @@ export default class Workspace {
             this.blurAndUnlock(user);
         });
 
-        this.listenForWhisper('updated', e => {
-            this.applyBroadcastedValueChange(e);
-        });
-
-        // Handle large payloads - fetch from server instead of receiving via WebSocket
-        this.channel.listenForWhisper('fetch-field', ({ handle, type, windowId }) => {
-            this.debug(`📥 Received fetch-field from ${windowId?.slice(-6)}, my windowId: ${this.windowId?.slice(-6)}`);
+        // Listen for data change notifications - always fetch from server
+        this.channel.listenForWhisper('data-changed', ({ handle, type, windowId }) => {
+            this.debug(`📥 Received data-changed from ${windowId?.slice(-6)}, my windowId: ${this.windowId?.slice(-6)}`);
             if (windowId === this.windowId) {
-                this.debug(`📥 Skipping own fetch-field`);
+                this.debug(`📥 Skipping own data-changed`);
                 return;
             }
 
-            // Wait a bit for the sender's persist to complete before fetching
-            // (broadcast fires at 500ms, persist at 1000ms, so we wait 600ms to be safe)
-            this.debug(`📥 Will fetch ${type} for "${handle}" from server in 600ms`);
-            setTimeout(() => {
-                this.loadCachedState('fetch-field listener');
-            }, 600);
-        });
-
-        this.listenForWhisper('meta-updated', e => {
-            this.applyBroadcastedMetaChange(e);
+            // Queue the update - will be applied when user is inactive or presses space/char
+            this.queuePendingUpdate(handle, type, windowId);
         });
 
         this.listenForWhisper('focus', ({ user, handle, windowId }) => {
@@ -390,6 +416,9 @@ export default class Workspace {
             if (windowId === this.windowId) return;
 
             this.debug(`Heard that user has changed focus`, { user, handle, windowId });
+
+            // Cancel any pending unlock for this field (user is back)
+            this.cancelPendingUnlock(handle);
 
             // Don't lock fields for our own other windows - only for other users
             if (user.id === this.user.id) {
@@ -412,23 +441,25 @@ export default class Workspace {
             if (user.id === this.user.id) {
                 this.blur(user);
             } else {
-                this.blurAndUnlock(user, handle);
-                // Show toast that another user finished editing
+                // Delay unlock by 3 seconds for other users
+                this.blur(user);
                 if (handle) {
-                    const fieldName = this.formatFieldName(handle);
-                    // Statamic.$toast.success(`${fieldName} is no longer being edited by ${user.name}.`, { duration: 2000 });
+                    this.scheduleDelayedUnlock(handle);
                 }
             }
         });
 
-        this.listenForWhisper('force-unlock', ({ targetUser, originUser }) => {
+        this.listenForWhisper('force-unlock', ({ targetUser, originUser, windowId }) => {
+            // Ignore if from our own window
+            if (windowId === this.windowId) return;
+
             this.debug(`Heard that user has requested another be unlocked`, { targetUser, originUser });
 
             if (targetUser.id !== this.user.id) return;
 
             document.activeElement.blur();
             this.blurAndUnlock(this.user);
-            this.whisper('blur', { user: this.user });
+            this.whisper('blur', { user: this.user, windowId: this.windowId });
             Statamic.$toast.info(`${originUser.name} has unlocked your editor.`, { duration: false });
         });
 
@@ -524,7 +555,7 @@ export default class Workspace {
         });
 
         component.on('unlock', (targetUser) => {
-            this.whisper('force-unlock', { targetUser, originUser: this.user });
+            this.whisper('force-unlock', { targetUser, originUser: this.user, windowId: this.windowId });
         });
     }
 
@@ -572,14 +603,96 @@ export default class Workspace {
     initializeFocus() {
         this.container.$on('focus', handle => {
             const user = this.user;
+
+            // Cancel any pending unlock for this field
+            if (this.pendingFieldUnlocks[handle]) {
+                clearTimeout(this.pendingFieldUnlocks[handle]);
+                delete this.pendingFieldUnlocks[handle];
+                this.debug(`🔓 Cancelled pending unlock for "${handle}"`);
+            }
+
+            // Track currently focused field and start inactivity timer
+            this.currentFocusedField = handle;
+            this.resetFieldInactivityTimer(handle);
+
             this.focus(user, handle);
             this.whisper('focus', { user, handle, windowId: this.windowId });
         });
+
         this.container.$on('blur', handle => {
             const user = this.user;
-            this.blur(user, handle);
+
+            // Clear inactivity timer
+            this.clearFieldInactivityTimer(handle);
+            this.currentFocusedField = null;
+
+            // Delay unlock by 3 seconds - still inform others immediately via focus state
+            this.blur(user);
             this.whisper('blur', { user, handle, windowId: this.windowId });
         });
+
+        // Listen for keypress to reset field inactivity timer
+        this.keypressHandler = (e) => {
+            if (this.currentFocusedField) {
+                this.resetFieldInactivityTimer(this.currentFocusedField);
+                this.lastKeyPressTime = Date.now();
+
+                // If space or other character, trigger pending updates
+                if (e.key === ' ' || e.key.length === 1) {
+                    this.triggerPendingUpdates();
+                }
+            }
+        };
+        document.addEventListener('keydown', this.keypressHandler);
+    }
+
+    resetFieldInactivityTimer(handle) {
+        this.clearFieldInactivityTimer(handle);
+
+        this.fieldInactivityTimers[handle] = setTimeout(() => {
+            this.debug(`⏰ Field "${handle}" inactive for 10 seconds, auto-unlocking`);
+            this.autoUnlockField(handle);
+        }, this.fieldInactivityTimeout);
+    }
+
+    clearFieldInactivityTimer(handle) {
+        if (this.fieldInactivityTimers[handle]) {
+            clearTimeout(this.fieldInactivityTimers[handle]);
+            delete this.fieldInactivityTimers[handle];
+        }
+    }
+
+    autoUnlockField(handle) {
+        // Force blur the active element if it matches
+        if (document.activeElement && this.currentFocusedField === handle) {
+            document.activeElement.blur();
+        }
+
+        this.currentFocusedField = null;
+        this.blur(this.user);
+        this.whisper('blur', { user: this.user, handle, windowId: this.windowId });
+        Statamic.$toast.info(`Field auto-unlocked due to inactivity.`, { duration: 2000 });
+    }
+
+    scheduleDelayedUnlock(handle) {
+        // Cancel any existing pending unlock for this field
+        this.cancelPendingUnlock(handle);
+
+        this.debug(`🔒 Scheduling unlock for "${handle}" in ${this.fieldUnlockDelay}ms`);
+
+        this.pendingFieldUnlocks[handle] = setTimeout(() => {
+            this.debug(`🔓 Executing delayed unlock for "${handle}"`);
+            Statamic.$store.commit(`publish/${this.container.name}/unlockField`, handle);
+            delete this.pendingFieldUnlocks[handle];
+        }, this.fieldUnlockDelay);
+    }
+
+    cancelPendingUnlock(handle) {
+        if (this.pendingFieldUnlocks[handle]) {
+            clearTimeout(this.pendingFieldUnlocks[handle]);
+            delete this.pendingFieldUnlocks[handle];
+            this.debug(`🔓 Cancelled pending unlock for "${handle}"`);
+        }
     }
 
     focus(user, handle) {
@@ -642,17 +755,13 @@ export default class Workspace {
         // Reset inactivity timer on any change
         this.resetActivityTimer();
 
-        // Only broadcast and persist if this change originated from THIS window
+        // Only broadcast if this change originated from THIS window
         if (!this.applyingBroadcast) {
             // Track when we made this local change
             this.lastLocalChangeTime = Date.now();
             this.debug(`📤 Will broadcast change for ${payload.handle}`);
+            // Broadcast will also persist to server
             this.debouncedBroadcastValueChangeFuncByHandle(payload.handle)(payload);
-
-            // Persist to server cache (only for our own changes from this window)
-            if (this.user.id == payload.user) {
-                this.persistValueChange(payload.handle, payload.value);
-            }
         } else {
             this.debug(`🚫 Not broadcasting - applyingBroadcast is true`);
         }
@@ -674,14 +783,10 @@ export default class Workspace {
         // Reset inactivity timer on any change
         this.resetActivityTimer();
 
-        // Only broadcast and persist if this change originated from THIS window
+        // Only broadcast if this change originated from THIS window
         if (!this.applyingBroadcast) {
+            // Broadcast will also persist to server
             this.debouncedBroadcastMetaChangeFuncByHandle(payload.handle)(payload);
-
-            // Persist to server cache (only for our own changes from this window)
-            if (this.user.id == payload.user) {
-                this.persistMetaChange(payload.handle, payload.value);
-            }
         }
     }
 
@@ -759,25 +864,21 @@ export default class Workspace {
         // Only broadcast if this change originated from THIS window (not from a broadcast we received)
         if (this.applyingBroadcast) {
             this.debug(`🚫 Skipping broadcast - applyingBroadcast is true`);
-            return { largePayload: false };
+            return;
         }
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
-            const fullPayload = { ...payload, windowId: this.windowId };
-
-            // For large payloads (>3KB), persist immediately and notify others to fetch from server
-            if (JSON.stringify(fullPayload).length > 3000) {
-                this.debug(`📦 Large payload for "${payload.handle}", persisting and sending fetch notification`);
-                // Wait for persist to complete before notifying others to fetch
-                await this.sendStateUpdate(payload.handle, payload.value, 'value');
-                this.channel.whisper('fetch-field', { handle: payload.handle, type: 'value', windowId: this.windowId });
-                return { largePayload: true }; // Signal that we already persisted
-            } else {
-                this.whisper('updated', fullPayload);
-            }
+            // Always persist to server first, then notify others
+            await this.sendStateUpdate(payload.handle, payload.value, 'value');
+            // Only send notification - data will be fetched from server
+            this.channel.whisper('data-changed', {
+                handle: payload.handle,
+                type: 'value',
+                windowId: this.windowId
+            });
+            this.debug(`📣 Notified others about value change for "${payload.handle}"`);
         }
-        return { largePayload: false };
     }
 
     async broadcastMetaChange(payload) {
@@ -786,19 +887,15 @@ export default class Workspace {
 
         // Only my own change events should be broadcasted
         if (this.user.id == payload.user) {
-            // Clone payload to avoid mutating the original (persist needs full data)
-            const payloadClone = { ...payload, value: clone(payload.value) };
-            const cleanedPayload = { ...this.cleanMetaPayload(payloadClone), windowId: this.windowId };
-
-            // For large payloads (>3KB), persist immediately and notify others to fetch from server
-            if (JSON.stringify(cleanedPayload).length > 3000) {
-                this.debug(`📦 Large meta payload for "${payload.handle}", persisting and sending fetch notification`);
-                // Wait for persist to complete before notifying others to fetch
-                await this.sendStateUpdate(payload.handle, payload.value, 'meta');
-                this.channel.whisper('fetch-field', { handle: payload.handle, type: 'meta', windowId: this.windowId });
-            } else {
-                this.whisper('meta-updated', cleanedPayload);
-            }
+            // Always persist to server first, then notify others
+            await this.sendStateUpdate(payload.handle, payload.value, 'meta');
+            // Only send notification - data will be fetched from server
+            this.channel.whisper('data-changed', {
+                handle: payload.handle,
+                type: 'meta',
+                windowId: this.windowId
+            });
+            this.debug(`📣 Notified others about meta change for "${payload.handle}"`);
         }
     }
 
@@ -843,71 +940,59 @@ export default class Workspace {
             .replace(/^./, str => str.toUpperCase());
     }
 
-    async applyBroadcastedValueChange(payload) {
-        // Ignore broadcasts from this same window
-        if (payload.windowId === this.windowId) return;
+    queuePendingUpdate(handle, type, windowId) {
+        // Track the pending update with timestamp
+        const key = `${handle}:${type}`;
+        this.pendingServerUpdates[key] = {
+            handle,
+            type,
+            windowId,
+            timestamp: Date.now()
+        };
 
-        // Don't overwrite if user has made recent local changes (protects against losing typing)
-        const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
-        if (timeSinceLastChange < this.localChangeProtectionMs) {
-            this.debug(`🛡️ Skipping value change - local change was ${timeSinceLastChange}ms ago`);
-            return;
-        }
+        this.debug(`📋 Queued update for "${handle}" (${type}), total pending: ${Object.keys(this.pendingServerUpdates).length}`);
 
-        // Skip if value is undefined or null (prevents component errors)
-        if (payload.value === undefined || payload.value === null) {
-            this.debug(`🛡️ Skipping value change - value is ${payload.value}`);
-            return;
-        }
-
-        this.debug('✅ Applying broadcasted value change', payload);
-
-        // Track this field as recently updated via broadcast (to protect from stale server data)
-        this.recentBroadcastUpdates[payload.handle] = Date.now();
-
-        // Mark that we're applying a broadcast to prevent re-broadcasting
-        this.applyingBroadcast = true;
-        try {
-            // Use commit instead of dispatch to avoid triggering autosave side effects
-            Statamic.$store.commit(`publish/${this.container.name}/setFieldValue`, payload);
-        } finally {
-            this.applyingBroadcast = false;
-        }
+        // Start or reset the inactivity timer for triggering updates
+        this.resetUpdateInactivityTimer();
     }
 
-    async applyBroadcastedMetaChange(payload) {
-        // Ignore broadcasts from this same window
-        if (payload.windowId === this.windowId) return;
+    resetUpdateInactivityTimer() {
+        if (this.updateInactivityTimer) {
+            clearTimeout(this.updateInactivityTimer);
+        }
 
-        // Don't overwrite if user has made recent local changes (protects against losing typing)
+        this.updateInactivityTimer = setTimeout(() => {
+            this.debug(`⏰ User inactive for ${this.updateInactivityDelay}ms, fetching pending updates`);
+            this.triggerPendingUpdates();
+        }, this.updateInactivityDelay);
+    }
+
+    triggerPendingUpdates() {
+        const pendingCount = Object.keys(this.pendingServerUpdates).length;
+        if (pendingCount === 0) {
+            return;
+        }
+
+        // Don't fetch if user has made recent local changes
         const timeSinceLastChange = Date.now() - this.lastLocalChangeTime;
         if (timeSinceLastChange < this.localChangeProtectionMs) {
-            this.debug(`🛡️ Skipping meta change - local change was ${timeSinceLastChange}ms ago`);
+            this.debug(`🛡️ Skipping update fetch - local change was ${timeSinceLastChange}ms ago`);
             return;
         }
 
-        // Skip if value is undefined or null (prevents component errors)
-        if (payload.value === undefined || payload.value === null) {
-            this.debug(`🛡️ Skipping meta change - value is ${payload.value}`);
-            return;
+        this.debug(`📥 Triggering fetch for ${pendingCount} pending updates`);
+
+        // Clear pending updates
+        this.pendingServerUpdates = {};
+
+        // Clear the timer
+        if (this.updateInactivityTimer) {
+            clearTimeout(this.updateInactivityTimer);
+            this.updateInactivityTimer = null;
         }
 
-        this.debug('✅ Applying broadcasted meta change', payload);
-
-        // Track this field as recently updated via broadcast (to protect from stale server data)
-        this.recentBroadcastUpdates[payload.handle] = Date.now();
-
-        let value = { ...this.lastMetaValues[payload.handle], ...payload.value };
-        payload.value = value;
-
-        // Mark that we're applying a broadcast to prevent re-broadcasting
-        this.applyingBroadcast = true;
-        try {
-            // Use commit instead of dispatch to avoid triggering autosave side effects
-            Statamic.$store.commit(`publish/${this.container.name}/setFieldMeta`, payload);
-        } finally {
-            this.applyingBroadcast = false;
-        }
+        // Fetch latest state from server
+        this.loadCachedState('triggerPendingUpdates');
     }
 
     debug(message, args) {
@@ -1109,28 +1194,6 @@ export default class Workspace {
             this.applyingBroadcast = false;
             this.loadingCachedState = false;
         }
-    }
-
-    persistValueChange(handle, value) {
-        this.debouncedPersistValueFuncByHandle(handle)({ handle, value });
-    }
-
-    persistMetaChange(handle, value) {
-        this.debouncedPersistMetaFuncByHandle(handle)({ handle, value });
-    }
-
-    debouncedPersistValueFuncByHandle(handle) {
-        return this.getOrCreateDebouncedFunc(
-            this.debouncedPersistValueFuncsByHandle, handle,
-            (payload) => this.sendStateUpdate(payload.handle, payload.value, 'value'), 1000
-        );
-    }
-
-    debouncedPersistMetaFuncByHandle(handle) {
-        return this.getOrCreateDebouncedFunc(
-            this.debouncedPersistMetaFuncsByHandle, handle,
-            (payload) => this.sendStateUpdate(payload.handle, payload.value, 'meta'), 1000
-        );
     }
 
     async sendStateUpdate(handle, value, type) {
