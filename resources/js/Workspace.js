@@ -373,7 +373,7 @@ export default class Workspace {
                 this.focusAndLock(user, handle);
                 // Show toast that another user is editing this field
                 const fieldName = this.formatFieldName(handle);
-                Statamic.$toast.info(`${fieldName} is being edited by ${user.name}.`, { duration: 2000 });
+                // Statamic.$toast.info(`${fieldName} is being edited by ${user.name}.`, { duration: 2000 });
             }
         });
 
@@ -391,7 +391,7 @@ export default class Workspace {
                 // Show toast that another user finished editing
                 if (handle) {
                     const fieldName = this.formatFieldName(handle);
-                    Statamic.$toast.success(`${fieldName} is no longer being edited by ${user.name}.`, { duration: 2000 });
+                    // Statamic.$toast.success(`${fieldName} is no longer being edited by ${user.name}.`, { duration: 2000 });
                 }
             }
         });
